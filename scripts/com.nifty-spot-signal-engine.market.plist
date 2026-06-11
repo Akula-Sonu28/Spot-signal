@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nifty-spot-signal-engine.market</string>
+
+    <key>Comment</key>
+    <string>Start NIFTY signal bot at 09:10 IST Mon–Fri; caffeinate until bot exits ~15:30</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PROJECT_ROOT__/scripts/run_market_session.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_ROOT__</string>
+
+    <key>TimeZone</key>
+    <string>Asia/Kolkata</string>
+
+  <!-- Weekday: 1=Mon … 5=Fri (launchd convention) -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Weekday</key><integer>1</integer>
+            <key>Hour</key><integer>9</integer>
+            <key>Minute</key><integer>10</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>2</integer>
+            <key>Hour</key><integer>9</integer>
+            <key>Minute</key><integer>10</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>3</integer>
+            <key>Hour</key><integer>9</integer>
+            <key>Minute</key><integer>10</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>4</integer>
+            <key>Hour</key><integer>9</integer>
+            <key>Minute</key><integer>10</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>5</integer>
+            <key>Hour</key><integer>9</integer>
+            <key>Minute</key><integer>10</integer>
+        </dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_ROOT__/data/live/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_ROOT__/data/live/launchd.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+    <!-- Restart only on crash (non-zero exit); normal 15:30 shutdown exits 0 and stays stopped -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+</dict>
+</plist>

@@ -1,0 +1,458 @@
+//@version=6
+// =============================================================================
+// NIFTY SPOT SIGNAL ENGINE FOR OPTIONS TRADING
+// Pine Script v6 | Strategy Mode | Non-Repainting | Intraday Only
+// =============================================================================
+//
+// A. EXPERT ASSESSMENT
+// --------------------
+// Strengths: Spot/option separation, HTF+5m structure, VWAP bias, session filters.
+// Corrections applied:
+//   - Spot 1:2.5 RR does NOT equal option premium 1:2.5 (delta/theta/IV/gamma).
+//   - ADX default raised to 20 (below 20 = no trend per Wilder).
+//   - EMA alignment used instead of fresh crossover (less late entries).
+//   - Optional volume spike filter added (1.2x SMA).
+//   - Optional trail-to-breakeven at 1R.
+//   - Expiry-day toggle with tighter SL option.
+//
+// B. CORRECTED FRAMING
+// --------------------
+// NIFTY Spot Momentum + Pullback Continuation on 5m chart.
+// Bullish spot signal => BUY CE | Bearish spot signal => BUY PE.
+// Execution layer is external: alerts + manual/webhook option buying.
+//
+// C. TRADING LOGIC
+// ----------------
+// BUY CE: HTF bullish + above VWAP + 9>21 EMA + RSI>55 + ADX>20 + bullish candle
+//         + candle not oversized vs ATR + session/risk filters pass.
+// BUY PE: Mirror bearish conditions.
+// EXIT: ATR SL, RR target, opposite signal, VWAP invalidation, EOD square-off.
+//
+// D. OPTIONS EXECUTION LIMITATIONS
+// --------------------------------
+// Pine cannot: auto-select strikes, read live premium/IV/delta/spread, or backtest
+// option P&L realistically. Alerts include strike/expiry instructions only.
+// Validate signals on actual ATM/1-ITM option premium charts before live trading.
+//
+// =============================================================================
+
+strategy(
+     title                  = "NIFTY Spot Signal Engine",
+     shorttitle             = "NIFTY SigEng",
+     overlay                = true,
+     default_qty_type       = strategy.percent_of_equity,
+     default_qty_value      = 100,
+     commission_type        = strategy.commission.cash_per_order,
+     commission_value       = 40,
+     slippage               = 2,
+     calc_on_every_tick     = false,
+     process_orders_on_close = true,
+     max_bars_back          = 500,
+     pyramiding             = 0,
+     initial_capital        = 100000,
+     currency               = currency.INR)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+string GRP_TF     = "1. Timeframe & EMA"
+string GRP_FILT   = "2. Momentum & Volatility Filters"
+string GRP_VWAP   = "3. VWAP"
+string GRP_RISK   = "4. Risk & Reward"
+string GRP_TRADE  = "5. Trade Management"
+string GRP_SESS   = "6. Session & Expiry"
+string GRP_OPT    = "7. Options Execution Notes"
+string GRP_VIS    = "8. Visuals"
+
+string htfPeriod      = input.timeframe("15", "Higher Timeframe", group = GRP_TF)
+int    emaFastLen     = input.int(9, "Fast EMA Length", minval = 1, group = GRP_TF)
+int    emaSlowLen     = input.int(21, "Slow EMA Length", minval = 1, group = GRP_TF)
+int    htfEmaLen      = input.int(21, "HTF EMA Length", minval = 1, group = GRP_TF)
+
+bool   useVwap        = input.bool(true, "Use VWAP Filter", group = GRP_VWAP)
+string vwapSrcInput   = input.string("hlc3", "VWAP Source", options = ["hlc3", "ohlc4", "close"], group = GRP_VWAP)
+
+int    rsiLen         = input.int(14, "RSI Length", minval = 2, group = GRP_FILT)
+float  rsiBullThresh  = input.float(55.0, "RSI Bullish Threshold (CE)", minval = 50, maxval = 80, group = GRP_FILT)
+float  rsiBearThresh  = input.float(45.0, "RSI Bearish Threshold (PE)", minval = 20, maxval = 50, group = GRP_FILT)
+int    adxLen         = input.int(14, "ADX Length", minval = 2, group = GRP_FILT)
+float  adxThresh      = input.float(20.0, "ADX Minimum Threshold", minval = 10, maxval = 50, step = 0.5, group = GRP_FILT)
+int    atrLen         = input.int(14, "ATR Length", minval = 1, group = GRP_FILT)
+float  atrMaxMult     = input.float(2.0, "Max Candle Size (x ATR)", minval = 0.5, maxval = 5, step = 0.1, group = GRP_FILT)
+bool   useMinAtr      = input.bool(true, "Require Minimum ATR (avoid dead chop)", group = GRP_FILT)
+float  minAtrPoints   = input.float(8.0, "Minimum ATR (points)", minval = 1, step = 0.5, group = GRP_FILT)
+bool   useVolFilter   = input.bool(true, "Use Volume Spike Filter", group = GRP_FILT)
+int    volSmaLen      = input.int(20, "Volume SMA Length", minval = 5, group = GRP_FILT)
+float  volMult        = input.float(1.2, "Volume Multiplier", minval = 1.0, step = 0.1, group = GRP_FILT)
+
+float  rrRatio        = input.float(2.5, "Risk-Reward Ratio", minval = 1.0, maxval = 5.0, step = 0.1, group = GRP_RISK)
+float  atrSlMult      = input.float(1.5, "ATR Stop-Loss Multiplier", minval = 0.5, maxval = 5.0, step = 0.1, group = GRP_RISK)
+bool   useSwingSl     = input.bool(false, "Use Swing High/Low SL (instead of ATR)", group = GRP_RISK)
+int    swingLookback  = input.int(5, "Swing Lookback Bars", minval = 2, maxval = 20, group = GRP_RISK)
+bool   trailBreakeven = input.bool(true, "Trail SL to Breakeven at 1R", group = GRP_RISK)
+bool   exitOnVwapFlip = input.bool(true, "Exit on VWAP Invalidation", group = GRP_RISK)
+
+int    maxTradesDay   = input.int(4, "Max Trades Per Day", minval = 1, maxval = 20, group = GRP_TRADE)
+int    cooldownBars   = input.int(3, "Cooldown Bars After Trade", minval = 0, maxval = 50, group = GRP_TRADE)
+int    cooldownLossBars = input.int(5, "Cooldown Bars After Loss", minval = 0, maxval = 50, group = GRP_TRADE)
+float  dailyMaxLoss   = input.float(200.0, "Daily Max Loss (points, 0=off)", minval = 0, step = 10, group = GRP_TRADE)
+float  dailyProfitLock = input.float(400.0, "Daily Profit Lock (points, 0=off)", minval = 0, step = 10, group = GRP_TRADE)
+bool   allowReversal  = input.bool(false, "Allow Immediate Reversal", group = GRP_TRADE)
+
+int    skipOpenMins   = input.int(15, "Skip First X Minutes After Open", minval = 0, maxval = 60, group = GRP_SESS)
+int    skipCloseMins  = input.int(20, "Skip Last X Minutes Before Close", minval = 0, maxval = 60, group = GRP_SESS)
+int    squareOffHour  = input.int(15, "Square-Off Hour (IST)", minval = 9, maxval = 15, group = GRP_SESS)
+int    squareOffMin   = input.int(10, "Square-Off Minute (IST)", minval = 0, maxval = 59, group = GRP_SESS)
+bool   allowExpiryDay = input.bool(false, "Allow Trading on Expiry Day (Thu)", group = GRP_SESS)
+float  expirySlMult   = input.float(1.0, "Expiry Day SL Multiplier", minval = 0.5, maxval = 2.0, step = 0.1, group = GRP_SESS)
+
+string strikePref     = input.string("ATM_or_1ITM", "Strike Preference Note", group = GRP_OPT)
+string premiumSlNote  = input.string("Use ~40-50% premium SL for live options", "Premium SL Note", group = GRP_OPT)
+
+bool   showDashboard  = input.bool(true, "Show Dashboard", group = GRP_VIS)
+bool   showSlTarget   = input.bool(true, "Show SL / Target Lines", group = GRP_VIS)
+
+string TZ = "Asia/Kolkata"
+
+// =============================================================================
+// HIGHER-TIMEFRAME TREND (NON-REPAINTING)
+// =============================================================================
+
+if timeframe.in_seconds() > timeframe.in_seconds(htfPeriod)
+    runtime.error("Chart timeframe must be <= higher timeframe (" + htfPeriod + "). Use 5m chart.")
+
+float htfEma = request.security(
+     syminfo.tickerid, htfPeriod,
+     ta.ema(close, htfEmaLen)[1],
+     lookahead = barmerge.lookahead_on)
+
+float htfEmaPrev = request.security(
+     syminfo.tickerid, htfPeriod,
+     ta.ema(close, htfEmaLen)[2],
+     lookahead = barmerge.lookahead_on)
+
+float htfClose = request.security(
+     syminfo.tickerid, htfPeriod,
+     close[1],
+     lookahead = barmerge.lookahead_on)
+
+bool htfBullish = htfClose > htfEma and htfEma > htfEmaPrev
+bool htfBearish = htfClose < htfEma and htfEma < htfEmaPrev
+
+// =============================================================================
+// CORE INDICATORS (CHART TIMEFRAME)
+// =============================================================================
+
+float vwapSrc = vwapSrcInput == "hlc3" ? hlc3 : vwapSrcInput == "ohlc4" ? ohlc4 : close
+float vwapVal = ta.vwap(vwapSrc)
+
+float emaFast = ta.ema(close, emaFastLen)
+float emaSlow = ta.ema(close, emaSlowLen)
+float rsiVal  = ta.rsi(close, rsiLen)
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+float atrVal  = ta.atr(atrLen)
+float volSma  = ta.sma(volume, volSmaLen)
+
+bool emaBullAlign = emaFast > emaSlow
+bool emaBearAlign = emaFast < emaSlow
+bool vwapBull     = not useVwap or close > vwapVal
+bool vwapBear     = not useVwap or close < vwapVal
+bool rsiBull      = rsiVal > rsiBullThresh
+bool rsiBear      = rsiVal < rsiBearThresh
+bool adxOk        = adxVal > adxThresh
+bool bullCandle   = close > open
+bool bearCandle   = close < open
+float candleRange = high - low
+bool candleOk     = candleRange <= atrVal * atrMaxMult
+bool atrVolOk     = not useMinAtr or atrVal >= minAtrPoints
+bool volOk        = not useVolFilter or nz(volume, 0) == 0 or volume >= volSma * volMult
+
+// =============================================================================
+// SESSION & EXPIRY FILTERS
+// =============================================================================
+
+int barMins = hour(time, TZ) * 60 + minute(time, TZ)
+int openMins  = 9 * 60 + 15 + skipOpenMins
+int closeMins = 15 * 60 + 30 - skipCloseMins
+int sqOffMins = squareOffHour * 60 + squareOffMin
+
+bool beforeOpenSkip = barMins < openMins
+bool afterCloseSkip = barMins >= closeMins
+bool inTradeWindow  = barMins >= openMins and barMins < closeMins
+bool isSquareOffBar = barMins >= sqOffMins
+bool isExpiryDay    = dayofweek(time, TZ) == dayofweek.thursday
+bool expiryOk       = allowExpiryDay or not isExpiryDay
+
+string sessionStatus = beforeOpenSkip ? "SKIP OPEN" : afterCloseSkip ? "SKIP CLOSE" : isSquareOffBar ? "SQUARE OFF" : inTradeWindow ? "ACTIVE" : "CLOSED"
+
+// =============================================================================
+// RISK CONTROLS & DAILY STATE
+// =============================================================================
+
+var int   tradesToday      = 0
+var float dayStartNetProfit = 0.0
+var int   lastTradeBar     = -10000
+var int   lastLossBar      = -10000
+var int   lastEntryBar     = -1
+var float activeSl         = na
+var float activeTarget     = na
+var float activeEntry      = na
+var int   activeDir        = 0
+var string lastExitReason  = ""
+
+bool isNewDay = ta.change(time("D")) != 0
+if isNewDay
+    tradesToday       := 0
+    dayStartNetProfit := strategy.netprofit
+
+float dailyPnL = strategy.netprofit - dayStartNetProfit
+bool dailyLossHit   = dailyMaxLoss > 0 and dailyPnL <= -dailyMaxLoss
+bool dailyProfitHit = dailyProfitLock > 0 and dailyPnL >= dailyProfitLock
+bool riskOk         = not dailyLossHit and not dailyProfitHit
+
+int barsSinceTrade = bar_index - lastTradeBar
+int barsSinceLoss  = bar_index - lastLossBar
+bool cooldownOk    = barsSinceTrade >= cooldownBars and barsSinceLoss >= cooldownLossBars
+bool tradesLeft    = tradesToday < maxTradesDay
+
+// =============================================================================
+// STOP-LOSS CALCULATION
+// =============================================================================
+
+float effectiveSlMult = isExpiryDay and allowExpiryDay ? atrSlMult * expirySlMult : atrSlMult
+
+calcLongSl() =>
+    if useSwingSl
+        ta.lowest(low, swingLookback)
+    else
+        close - atrVal * effectiveSlMult
+
+calcShortSl() =>
+    if useSwingSl
+        ta.highest(high, swingLookback)
+    else
+        close + atrVal * effectiveSlMult
+
+// =============================================================================
+// ENTRY CONDITIONS
+// =============================================================================
+
+bool flat           = strategy.position_size == 0
+bool noDupEntry     = bar_index != lastEntryBar
+bool sessionOk      = inTradeWindow and expiryOk and not isSquareOffBar
+
+bool longSetup = htfBullish and vwapBull and emaBullAlign and rsiBull and adxOk and bullCandle and candleOk and atrVolOk and volOk
+bool shortSetup = htfBearish and vwapBear and emaBearAlign and rsiBear and adxOk and bearCandle and candleOk and atrVolOk and volOk
+
+bool longSignal  = longSetup and sessionOk and riskOk and tradesLeft and cooldownOk and noDupEntry
+bool shortSignal = shortSetup and sessionOk and riskOk and tradesLeft and cooldownOk and noDupEntry
+
+bool canEnterLong  = longSignal and (flat or (allowReversal and strategy.position_size < 0))
+bool canEnterShort = shortSignal and (flat or (allowReversal and strategy.position_size > 0))
+
+// =============================================================================
+// JSON ALERT BUILDER
+// =============================================================================
+
+f_alertJson(string signalType, string direction, string optionSide, string reason, float entryPx, float slPx, float tgtPx) =>
+    string ts = str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss", TZ)
+    '{' +
+     '"signal":"' + signalType + '",' +
+     '"trade_direction":"' + direction + '",' +
+     '"underlying":"NIFTY",' +
+     '"suggested_option_side":"' + optionSide + '",' +
+     '"strike_instruction":"' + strikePref + '",' +
+     '"expiry_instruction":"current_weekly",' +
+     '"timeframe":"' + timeframe.period + '",' +
+     '"spot_entry":' + str.tostring(entryPx, format.mintick) + ',' +
+     '"spot_sl":' + str.tostring(slPx, format.mintick) + ',' +
+     '"spot_target":' + str.tostring(tgtPx, format.mintick) + ',' +
+     '"premium_sl_note":"' + premiumSlNote + '",' +
+     '"risk_reward_ratio":"1:' + str.tostring(rrRatio) + '",' +
+     '"timestamp":"' + ts + '",' +
+     '"reason":"' + reason + '"' +
+     '}'
+
+// =============================================================================
+// ENTRIES
+// =============================================================================
+
+if canEnterLong
+    if strategy.position_size < 0
+        strategy.close("BUY_PE", comment = "REVERSAL", alert_message = f_alertJson("EXIT_PE", "BEARISH", "PE", "opposite_signal_reversal", close, activeSl, activeTarget))
+    float sl = calcLongSl()
+    float risk = close - sl
+    float tgt = close + risk * rrRatio
+    activeSl     := sl
+    activeTarget := tgt
+    activeEntry  := close
+    activeDir    := 1
+    lastEntryBar := bar_index
+    lastTradeBar := bar_index
+    tradesToday  := tradesToday + 1
+    strategy.entry("BUY_CE", strategy.long, comment = "BUY CE", alert_message = f_alertJson("BUY_CE", "BULLISH", "CE", "HTF_bull+VWAP_above+EMA_align+RSI_momentum", close, sl, tgt))
+
+if canEnterShort
+    if strategy.position_size > 0
+        strategy.close("BUY_CE", comment = "REVERSAL", alert_message = f_alertJson("EXIT_CE", "BULLISH", "CE", "opposite_signal_reversal", close, activeSl, activeTarget))
+    float sl = calcShortSl()
+    float risk = sl - close
+    float tgt = close - risk * rrRatio
+    activeSl     := sl
+    activeTarget := tgt
+    activeEntry  := close
+    activeDir    := -1
+    lastEntryBar := bar_index
+    lastTradeBar := bar_index
+    tradesToday  := tradesToday + 1
+    strategy.entry("BUY_PE", strategy.short, comment = "BUY PE", alert_message = f_alertJson("BUY_PE", "BEARISH", "PE", "HTF_bear+VWAP_below+EMA_align+RSI_momentum", close, sl, tgt))
+
+// =============================================================================
+// TRAIL TO BREAKEVEN AT 1R
+// =============================================================================
+
+if strategy.position_size > 0 and not na(activeEntry) and not na(activeSl) and trailBreakeven
+    float riskDist = activeEntry - activeSl
+    if riskDist > 0 and high >= activeEntry + riskDist
+        activeSl := math.max(activeSl, activeEntry)
+
+if strategy.position_size < 0 and not na(activeEntry) and not na(activeSl) and trailBreakeven
+    float riskDist = activeSl - activeEntry
+    if riskDist > 0 and low <= activeEntry - riskDist
+        activeSl := math.min(activeSl, activeEntry)
+
+// =============================================================================
+// EXITS
+// =============================================================================
+
+bool vwapExitLong  = exitOnVwapFlip and strategy.position_size > 0 and close < vwapVal
+bool vwapExitShort = exitOnVwapFlip and strategy.position_size < 0 and close > vwapVal
+bool oppExitLong   = not allowReversal and shortSignal and strategy.position_size > 0
+bool oppExitShort  = not allowReversal and longSignal and strategy.position_size < 0
+
+if strategy.position_size > 0
+    strategy.exit("Exit_CE", from_entry = "BUY_CE", stop = activeSl, limit = activeTarget, alert_message = f_alertJson("EXIT_CE", "BULLISH", "CE", "sl_or_target", activeEntry, activeSl, activeTarget))
+
+if strategy.position_size < 0
+    strategy.exit("Exit_PE", from_entry = "BUY_PE", stop = activeSl, limit = activeTarget, alert_message = f_alertJson("EXIT_PE", "BEARISH", "PE", "sl_or_target", activeEntry, activeSl, activeTarget))
+
+if vwapExitLong
+    strategy.close("BUY_CE", comment = "VWAP EXIT", alert_message = f_alertJson("EXIT_CE", "BULLISH", "CE", "vwap_invalidation", close, activeSl, activeTarget))
+
+if vwapExitShort
+    strategy.close("BUY_PE", comment = "VWAP EXIT", alert_message = f_alertJson("EXIT_PE", "BEARISH", "PE", "vwap_invalidation", close, activeSl, activeTarget))
+
+if oppExitLong
+    strategy.close("BUY_CE", comment = "OPP SIGNAL", alert_message = f_alertJson("EXIT_CE", "BULLISH", "CE", "opposite_signal", close, activeSl, activeTarget))
+
+if oppExitShort
+    strategy.close("BUY_PE", comment = "OPP SIGNAL", alert_message = f_alertJson("EXIT_PE", "BEARISH", "PE", "opposite_signal", close, activeSl, activeTarget))
+
+if isSquareOffBar and strategy.position_size != 0
+    strategy.close_all(comment = "EOD SQ OFF", alert_message = f_alertJson("SQUARE_OFF", strategy.position_size > 0 ? "BULLISH" : "BEARISH", strategy.position_size > 0 ? "CE" : "PE", "end_of_day_square_off", close, activeSl, activeTarget))
+
+// Track loss cooldown & exit reason labels
+bool wasLong  = strategy.position_size[1] > 0
+bool wasShort = strategy.position_size[1] < 0
+bool nowFlat  = strategy.position_size == 0
+
+if (wasLong or wasShort) and nowFlat
+  lastTradeBar := bar_index
+  float pnl = strategy.netprofit - strategy.netprofit[1]
+  if pnl < 0
+      lastLossBar := bar_index
+  if wasLong
+      if low <= activeSl
+          lastExitReason := "STOP LOSS HIT"
+      else if high >= activeTarget
+          lastExitReason := "TARGET HIT"
+      else if isSquareOffBar
+          lastExitReason := "SQUARE OFF"
+      else
+          lastExitReason := "EXIT CE"
+  else
+      if high >= activeSl
+          lastExitReason := "STOP LOSS HIT"
+      else if low <= activeTarget
+          lastExitReason := "TARGET HIT"
+      else if isSquareOffBar
+          lastExitReason := "SQUARE OFF"
+      else
+          lastExitReason := "EXIT PE"
+  activeDir := 0
+  if lastExitReason == "STOP LOSS HIT"
+      alert(f_alertJson("STOP_LOSS_HIT", wasLong ? "BULLISH" : "BEARISH", wasLong ? "CE" : "PE", "stop_loss_hit", close, activeSl, activeTarget), alert.freq_once_per_bar_close)
+  else if lastExitReason == "TARGET HIT"
+      alert(f_alertJson("TARGET_HIT", wasLong ? "BULLISH" : "BEARISH", wasLong ? "CE" : "PE", "target_hit", close, activeSl, activeTarget), alert.freq_once_per_bar_close)
+  else if lastExitReason == "SQUARE OFF"
+      alert(f_alertJson("SQUARE_OFF", wasLong ? "BULLISH" : "BEARISH", wasLong ? "CE" : "PE", "end_of_day_square_off", close, activeSl, activeTarget), alert.freq_once_per_bar_close)
+
+// =============================================================================
+// PLOTS
+// =============================================================================
+
+plot(emaFast, "EMA Fast", color = color.new(color.blue, 0), linewidth = 1)
+plot(emaSlow, "EMA Slow", color = color.new(color.orange, 0), linewidth = 1)
+plot(vwapVal, "VWAP", color = color.new(color.purple, 0), linewidth = 2, style = plot.style_linebr)
+plot(htfEma, "HTF EMA", color = color.new(color.gray, 40), linewidth = 2, display = display.none)
+
+color trendBg = htfBullish ? color.new(color.green, 93) : htfBearish ? color.new(color.red, 93) : color.new(color.gray, 95)
+bgcolor(trendBg, title = "HTF Trend Bias")
+
+plot(showSlTarget and strategy.position_size != 0 ? activeSl : na, "Stop Loss", color = color.red, style = plot.style_linebr, linewidth = 2)
+plot(showSlTarget and strategy.position_size != 0 ? activeTarget : na, "Target", color = color.green, style = plot.style_linebr, linewidth = 2)
+
+plotshape(canEnterLong, title = "BUY CE", style = shape.triangleup, location = location.belowbar, color = color.lime, size = size.small, text = "CE")
+plotshape(canEnterShort, title = "BUY PE", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.small, text = "PE")
+
+bool exitMarker = (wasLong or wasShort) and nowFlat
+plotshape(exitMarker and lastExitReason == "TARGET HIT", title = "Target Hit", style = shape.circle, location = location.abovebar, color = color.green, size = size.tiny, text = "TGT")
+plotshape(exitMarker and lastExitReason == "STOP LOSS HIT", title = "SL Hit", style = shape.xcross, location = location.belowbar, color = color.red, size = size.tiny, text = "SL")
+
+// =============================================================================
+// DASHBOARD
+// =============================================================================
+
+string biasText = htfBullish ? "BULLISH" : htfBearish ? "BEARISH" : "NEUTRAL"
+color  biasColor = htfBullish ? color.green : htfBearish ? color.red : color.gray
+
+string tradeText = strategy.position_size > 0 ? "LONG / BUY CE" : strategy.position_size < 0 ? "SHORT / BUY PE" : "FLAT"
+string optSide   = strategy.position_size > 0 ? "CE" : strategy.position_size < 0 ? "PE" : longSetup ? "CE (setup)" : shortSetup ? "PE (setup)" : "--"
+
+string rsiStatus = rsiBull ? "Bull" : rsiBear ? "Bear" : "Neutral"
+string adxStatus = adxOk ? "Trending" : "Chop"
+string atrStatus = atrVolOk ? "OK" : "Low Vol"
+
+if showDashboard and barstate.islast
+    var table dash = table.new(position.top_right, 2, 11, bgcolor = color.new(color.black, 20), border_width = 1, force_overlay = true)
+    table.cell(dash, 0, 0, "Metric", text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+    table.cell(dash, 1, 0, "Value", text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+    table.cell(dash, 0, 1, "NIFTY Bias", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 1, biasText, text_color = biasColor, text_size = size.small)
+    table.cell(dash, 0, 2, "Active Trade", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 2, tradeText, text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 3, "RSI", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 3, str.tostring(rsiVal, "#.0") + " (" + rsiStatus + ")", text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 4, "ADX", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 4, str.tostring(adxVal, "#.0") + " (" + adxStatus + ")", text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 5, "ATR", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 5, str.tostring(atrVal, "#.##") + " (" + atrStatus + ")", text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 6, "Trades Today", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 6, str.tostring(tradesToday) + " / " + str.tostring(maxTradesDay), text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 7, "Risk-Reward", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 7, "1:" + str.tostring(rrRatio), text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 8, "Session", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 8, sessionStatus, text_color = inTradeWindow ? color.lime : color.orange, text_size = size.small)
+    table.cell(dash, 0, 9, "Option Side", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 9, optSide, text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 10, "Strike Type", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 10, strikePref, text_color = color.white, text_size = size.small)
+
+// =============================================================================
+// ALERT CONDITIONS (for manual alert creation without order fills)
+// =============================================================================
+
+alertcondition(canEnterLong, title = "BUY CE Signal", message = "BUY CE: NIFTY bullish setup confirmed on bar close.")
+alertcondition(canEnterShort, title = "BUY PE Signal", message = "BUY PE: NIFTY bearish setup confirmed on bar close.")
+alertcondition(isSquareOffBar and strategy.position_size != 0, title = "Square Off Warning", message = "Square off all open NIFTY option positions before market close.")

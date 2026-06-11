@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nifty-spot-signal-engine.telegram</string>
+
+    <key>Comment</key>
+    <string>Always-on Telegram remote control (/start, /stop, /status)</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PROJECT_ROOT__/scripts/run_telegram_remote.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_ROOT__</string>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_ROOT__/data/live/telegram-remote.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_ROOT__/data/live/telegram-remote.err.log</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+</dict>
+</plist>

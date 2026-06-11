@@ -1,0 +1,33 @@
+timestamp,event_type,direction,side,price,stop,target,or_high,or_low,adx,vwap,atr,reason,bar_index,extra
+2026-06-09T21:57:43.852069+05:30,BOT_STARTED,SYSTEM,NONE,0.0,,,,,,,,Live monitor started (AUTO_TRADE=False),-1,{}
+2026-06-10T09:10:07.281603+05:30,BOT_STARTED,SYSTEM,NONE,0.0,,,,,,,,Live monitor started (AUTO_TRADE=False),-1,,,,,,,,,,,{}
+2026-06-10T09:15:17.762024+05:30,DATA_ERROR,SYSTEM,NONE,0.0,,,,,,,,Failed after 3 attempts: No intraday candles returned for NIFTY index,-1,,,,,,,,,,,{}
+2026-06-10T09:15:48.221646+05:30,DATA_ERROR,SYSTEM,NONE,0.0,,,,,,,,Failed after 3 attempts: No intraday candles returned for NIFTY index,-1,,,,,,,,,,,{}
+2026-06-10T09:16:10.905841+05:30,CATCH_UP,SYSTEM,NONE,0.0,,,,,,,,Silent catch-up complete through None,-1,,,,,,,,,,,{}
+2026-06-10T09:16:32.551791+05:30,CATCH_UP,SYSTEM,NONE,0.0,,,,,,,,Silent catch-up complete through None,-1,,,,,,,,,,,{}
+2026-06-10T09:16:54.223703+05:30,CATCH_UP,SYSTEM,NONE,0.0,,,,,,,,Silent catch-up complete through None,-1,,,,,,,,,,,{}
+2026-06-10T09:17:15.970916+05:30,CATCH_UP,SYSTEM,NONE,0.0,,,,,,,,Silent catch-up complete through None,-1,,,,,,,,,,,{}
+2026-06-10T09:17:37.729502+05:30,CATCH_UP,SYSTEM,NONE,0.0,,,,,,,,Silent catch-up complete through None,-1,,,,,,,,,,,{}
+2026-06-10T09:17:59.470906+05:30,CATCH_UP,SYSTEM,NONE,0.0,,,,,,,,Silent catch-up complete through None,-1,,,,,,,,,,,{}
+2026-06-10T09:18:21.212279+05:30,CATCH_UP,SYSTEM,NONE,0.0,,,,,,,,Silent catch-up complete through None,-1,,,,,,,,,,,{}
+2026-06-10T09:18:42.942588+05:30,CATCH_UP,SYSTEM,NONE,0.0,,,,,,,,Silent catch-up complete through None,-1,,,,,,,,,,,{}
+2026-06-10T09:19:04.736700+05:30,CATCH_UP,SYSTEM,NONE,0.0,,,,,,,,Silent catch-up complete through None,-1,,,,,,,,,,,{}
+2026-06-10T09:19:26.631784+05:30,CATCH_UP,SYSTEM,NONE,0.0,,,,,,,,Silent catch-up complete through None,-1,,,,,,,,,,,{}
+2026-06-10T09:19:48.484616+05:30,CATCH_UP,SYSTEM,NONE,0.0,,,,,,,,Silent catch-up complete through None,-1,,,,,,,,,,,{}
+2026-06-10T09:20:10.188729+05:30,DATA_STALE,SYSTEM,NONE,0.0,,,,,,,,Candle feed appears stale; skipping signal generation,-1,,,,,,,,,,,{}
+2026-06-10T09:20:33.227009+05:30,CATCH_UP,SYSTEM,NONE,0.0,,,,,,,,Silent catch-up complete through 2026-06-10T09:15:00+05:30,-1,,,,,,,,,,,{}
+2026-06-10T09:30:20.953913+05:30,OR_READY,SYSTEM,NONE,0.0,,,,,,,,OR 23350.2/23217.3 width=132.90,-1,,,,,,,,,,,{}
+2026-06-11T09:19:58.433851+05:30,BOT_STARTED,SYSTEM,NONE,0.0,,,,,,,,Live monitor started (AUTO_TRADE=False),-1,,,,,,,,,,,{}
+2026-06-11T09:20:00.184463+05:30,CATCH_UP,SYSTEM,NONE,0.0,,,,,,,,Silent catch-up complete through None,-1,,,,,,,,,,,{}
+2026-06-11T10:09:01.197291+05:30,OR_READY,SYSTEM,NONE,0.0,,,,,,,,OR 23148.05/23072.05 width=76.00,-1,,,,,,,,,,,{}
+2026-06-11T10:09:01.202313+05:30,CATCH_UP,SYSTEM,NONE,0.0,,,,,,,,Silent catch-up complete through 2026-06-11T10:00:00+05:30,-1,,,,,,,,,,,{}
+2026-06-11T15:31:17.171358+05:30,BOT_STOPPED,SYSTEM,NONE,0.0,,,,,,,,Monitor stopped,-1,,,,,,,,,,,{}
+2026-06-11T16:51:37.146455+05:30,BOT_STARTED,SYSTEM,NONE,0.0,,,,,,,,Live monitor started (AUTO_TRADE=False),-1,,,,,,,,,,,{}
+2026-06-11T17:01:28.212212+05:30,BOT_STARTED,SYSTEM,NONE,0.0,,,,,,,,Live monitor started (AUTO_TRADE=False),-1,,,,,,,,,,,{}
+2026-06-11T17:01:29.198920+05:30,BOT_STOPPED,SYSTEM,NONE,0.0,,,,,,,,Monitor stopped,-1,,,,,,,,,,,{}
+2026-06-11T17:07:16.503876+05:30,BOT_STARTED,SYSTEM,NONE,0.0,,,,,,,,Live monitor started (AUTO_TRADE=False),-1,,,,,,,,,,,{}
+2026-06-11T17:07:17.475290+05:30,BOT_STOPPED,SYSTEM,NONE,0.0,,,,,,,,Monitor stopped,-1,,,,,,,,,,,{}
+2026-06-11T17:44:40.215283+05:30,BOT_STARTED,SYSTEM,NONE,0.0,,,,,,,,Live monitor started (AUTO_TRADE=False),-1,,,,,,,,,,,{}
+2026-06-11T17:44:41.178236+05:30,BOT_STOPPED,SYSTEM,NONE,0.0,,,,,,,,Monitor stopped,-1,,,,,,,,,,,{}
+2026-06-11T17:46:59.032526+05:30,BOT_STARTED,SYSTEM,NONE,0.0,,,,,,,,Live monitor started (AUTO_TRADE=False),-1,,,,,,,,,,,{}
+2026-06-11T17:46:59.952504+05:30,BOT_STOPPED,SYSTEM,NONE,0.0,,,,,,,,Monitor stopped,-1,,,,,,,,,,,{}

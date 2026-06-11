@@ -1,0 +1,30 @@
+{
+  "session_date": "2026-06-11",
+  "last_processed_candle": "2026-06-11T15:25:00+05:30",
+  "or_alert_sent": true,
+  "bar_index": 299,
+  "position": {
+    "side": "FLAT",
+    "entry_price": null,
+    "stop": null,
+    "target": null,
+    "entry_time": null,
+    "entry_bar_index": null,
+    "option_strike": null,
+    "option_expiry": null,
+    "option_symbol": null,
+    "option_bid": null,
+    "option_ask": null
+  },
+  "day": {
+    "session_date": "2026-06-11",
+    "or_high": 23148.05,
+    "or_low": 23072.05,
+    "or_defined": true,
+    "or_bars_seen": 2,
+    "trades_today": 1,
+    "fired_long_today": true,
+    "fired_short_today": false,
+    "last_entry_bar_index": 231
+  }
+}

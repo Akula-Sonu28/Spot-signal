@@ -1,0 +1,595 @@
+//@version=6
+strategy(
+     "NIFTY Spot Signal Engine -> CE/PE Option Buying Framework",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 100000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.02,
+     slippage = 1,
+     calc_on_every_tick = false,
+     calc_on_order_fills = false,
+     process_orders_on_close = true,
+     margin_long = 100,
+     margin_short = 100,
+     max_labels_count = 500
+)
+
+//=============================================================================
+// INPUT GROUPS
+//=============================================================================
+const string groupTrend   = "1. Trend / Direction Filters"
+const string groupMom     = "2. Momentum / Chop Filters"
+const string groupRisk    = "3. Stop, Target, Risk Controls"
+const string groupSession = "4. Intraday Session Controls"
+const string groupExpiry  = "5. Expiry-Day Controls"
+const string groupOption  = "6. Options Execution Notes"
+const string groupVisual  = "7. Visuals / Dashboard"
+
+//=============================================================================
+// 1. TREND / DIRECTION FILTERS
+//=============================================================================
+string htfInput      = input.timeframe("15", "Higher timeframe for trend filter", group = groupTrend)
+int htfEmaLen        = input.int(50, "HTF EMA length", minval = 1, group = groupTrend)
+int fastEmaLen       = input.int(9, "Fast EMA length", minval = 1, group = groupTrend)
+int slowEmaLen       = input.int(21, "Slow EMA length", minval = 1, group = groupTrend)
+bool useVWAP         = input.bool(true, "Use VWAP direction filter", group = groupTrend)
+
+//=============================================================================
+// 2. MOMENTUM / CHOP FILTERS
+//=============================================================================
+int rsiLen           = input.int(14, "RSI length", minval = 1, group = groupMom)
+float rsiBullTh      = input.float(55.0, "CE RSI threshold", minval = 1, maxval = 99, step = 0.5, group = groupMom)
+float rsiBearTh      = input.float(45.0, "PE RSI threshold", minval = 1, maxval = 99, step = 0.5, group = groupMom)
+
+int adxDiLen         = input.int(14, "ADX DI length", minval = 1, group = groupMom)
+int adxSmooth        = input.int(14, "ADX smoothing", minval = 1, group = groupMom)
+float adxTh          = input.float(18.0, "ADX threshold", minval = 1, step = 0.5, group = groupMom)
+
+int atrLen           = input.int(14, "ATR length", minval = 1, group = groupMom)
+bool useAtrChop      = input.bool(true, "Avoid extremely low ATR chop", group = groupMom)
+int atrMaLen         = input.int(20, "ATR average length", minval = 2, group = groupMom)
+float minAtrVsAvg    = input.float(0.65, "Minimum ATR vs ATR average", minval = 0.1, maxval = 2.0, step = 0.05, group = groupMom)
+
+float minBodyAtr     = input.float(0.10, "Minimum candle body as ATR fraction", minval = 0.0, maxval = 1.0, step = 0.05, group = groupMom)
+float maxRangeAtr    = input.float(1.80, "Maximum candle range as ATR multiple", minval = 0.5, maxval = 5.0, step = 0.1, group = groupMom)
+float closeStrength  = input.float(0.58, "Strong close location, CE upper / PE lower", minval = 0.50, maxval = 0.90, step = 0.01, group = groupMom)
+
+//=============================================================================
+// 3. STOP, TARGET, RISK CONTROLS
+//=============================================================================
+float rrInput        = input.float(2.5, "Risk-reward ratio", minval = 0.5, step = 0.1, group = groupRisk)
+float atrSlMult      = input.float(1.10, "ATR stop-loss multiplier", minval = 0.2, step = 0.05, group = groupRisk)
+string stopMode      = input.string("ATR", "Stop-loss mode", options = ["ATR", "Swing", "Wider ATR/Swing"], group = groupRisk)
+int swingLookback    = input.int(5, "Swing stop lookback bars", minval = 2, maxval = 30, group = groupRisk)
+float swingBufferAtr = input.float(0.10, "Swing stop ATR buffer", minval = 0.0, maxval = 1.0, step = 0.05, group = groupRisk)
+
+int maxTradesDay     = input.int(4, "Maximum trades per day", minval = 1, maxval = 20, group = groupRisk)
+int cooldownBars     = input.int(2, "Cooldown bars after any closed trade", minval = 0, maxval = 50, group = groupRisk)
+int lossCooldownBars = input.int(4, "Cooldown bars after losing trade", minval = 0, maxval = 100, group = groupRisk)
+
+float dailyMaxLoss   = input.float(0.0, "Daily max loss in strategy currency, 0 = off", minval = 0.0, step = 100.0, group = groupRisk)
+float dailyProfitLock = input.float(0.0, "Daily profit lock in strategy currency, 0 = off", minval = 0.0, step = 100.0, group = groupRisk)
+
+bool exitOnOpposite  = input.bool(true, "Exit on opposite signal", group = groupRisk)
+bool exitTrendInvalid = input.bool(false, "Optional exit on trend invalidation", group = groupRisk)
+bool allowReversal   = input.bool(false, "Allow immediate CE/PE reversal", group = groupRisk)
+
+//=============================================================================
+// 4. SESSION CONTROLS
+//=============================================================================
+string tzInput       = input.string("Asia/Kolkata", "Session timezone", group = groupSession)
+
+int marketStartH     = input.int(9, "Market start hour", minval = 0, maxval = 23, group = groupSession)
+int marketStartM     = input.int(15, "Market start minute", minval = 0, maxval = 59, group = groupSession)
+int marketEndH       = input.int(15, "Market end hour", minval = 0, maxval = 23, group = groupSession)
+int marketEndM       = input.int(30, "Market end minute", minval = 0, maxval = 59, group = groupSession)
+
+int avoidOpenMins    = input.int(15, "Avoid first X minutes after open", minval = 0, maxval = 120, group = groupSession)
+int avoidCloseMins   = input.int(20, "Avoid last X minutes before close", minval = 0, maxval = 120, group = groupSession)
+
+int squareOffH       = input.int(15, "Square-off hour", minval = 0, maxval = 23, group = groupSession)
+int squareOffM       = input.int(15, "Square-off minute", minval = 0, maxval = 59, group = groupSession)
+
+//=============================================================================
+// 5. EXPIRY-DAY CONTROLS
+//=============================================================================
+string expiryDayInput = input.string("Tuesday", "Configured weekly expiry day", options = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"], group = groupExpiry)
+bool avoidExpiryDay   = input.bool(false, "Avoid configured expiry day", group = groupExpiry)
+bool expiryDayMode    = input.bool(false, "Enable expiry-day mode", group = groupExpiry)
+float expiryRsiBoost  = input.float(2.0, "Expiry mode RSI extra filter", minval = 0.0, maxval = 10.0, step = 0.5, group = groupExpiry)
+float expiryAdxBoost  = input.float(2.0, "Expiry mode ADX extra filter", minval = 0.0, maxval = 10.0, step = 0.5, group = groupExpiry)
+
+//=============================================================================
+// 6. OPTIONS EXECUTION NOTES
+//=============================================================================
+string strikePref = input.string(
+     "ATM or 1-step ITM",
+     "Suggested option strike",
+     options = ["ATM", "1-step ITM", "ATM or 1-step ITM"],
+     group = groupOption
+)
+
+bool allowFarOTM = input.bool(false, "Allow far OTM note in alerts", group = groupOption)
+
+string expiryInstruction = input.string(
+     "Use current weekly expiry from broker contract master; manually adjust for holidays.",
+     "Expiry instruction in alerts",
+     group = groupOption
+)
+
+string premiumInstruction = input.string(
+     "Execution layer must validate option premium, bid-ask spread, liquidity, IV/delta, and broker-side SL/target.",
+     "Premium SL/target instruction in alerts",
+     group = groupOption
+)
+
+string strikeInstructionText = strikePref + (allowFarOTM ? "; far OTM enabled by user" : "; avoid far OTM")
+
+//=============================================================================
+// 7. VISUALS
+//=============================================================================
+bool showHTFEMA       = input.bool(true, "Plot confirmed HTF EMA", group = groupVisual)
+bool showBiasBg       = input.bool(true, "Show HTF bias background", group = groupVisual)
+bool showTradeLevels  = input.bool(true, "Plot active stop and target", group = groupVisual)
+bool showDashboard    = input.bool(true, "Show dashboard", group = groupVisual)
+bool showMarkers      = input.bool(true, "Show entry/exit markers", group = groupVisual)
+
+//=============================================================================
+// HELPER FUNCTIONS
+//=============================================================================
+f_dow(string dow) =>
+    switch dow
+        "Monday"    => dayofweek.monday
+        "Tuesday"   => dayofweek.tuesday
+        "Wednesday" => dayofweek.wednesday
+        "Thursday"  => dayofweek.thursday
+        "Friday"    => dayofweek.friday
+        => dayofweek.tuesday
+
+f_safe(string txt) =>
+    str.replace_all(txt, "\"", "'")
+
+f_num(float x) =>
+    na(x) ? "null" : str.tostring(x, format.mintick)
+
+f_json(string sig, string dir, string optSide, float entryPrice, float stopPrice, float targetPrice, string reasonText) =>
+    "{" +
+    "\"signal_type\":\"" + f_safe(sig) + "\"," +
+    "\"trade_direction\":\"" + f_safe(dir) + "\"," +
+    "\"underlying_symbol\":\"" + f_safe(syminfo.tickerid) + "\"," +
+    "\"signal_source\":\"NIFTY_SPOT\"," +
+    "\"suggested_option_side\":\"" + f_safe(optSide) + "\"," +
+    "\"strike_selection_instruction\":\"" + f_safe(strikeInstructionText) + "\"," +
+    "\"expiry_instruction\":\"" + f_safe(expiryInstruction) + "\"," +
+    "\"timeframe\":\"" + f_safe(timeframe.period) + "\"," +
+    "\"spot_entry_price\":" + f_num(entryPrice) + "," +
+    "\"spot_stop_loss\":" + f_num(stopPrice) + "," +
+    "\"spot_target\":" + f_num(targetPrice) + "," +
+    "\"premium_based_sl_target_instruction\":\"" + f_safe(premiumInstruction) + "\"," +
+    "\"risk_reward\":" + str.tostring(rrInput, "#.##") + "," +
+    "\"timestamp_exchange_tz\":\"" + str.format_time(time_close, "yyyy-MM-dd HH:mm:ss", tzInput) + "\"," +
+    "\"reason\":\"" + f_safe(reasonText) + "\"" +
+    "}"
+
+//=============================================================================
+// SAFETY CHECK: HTF MUST BE ABOVE CHART TF
+//=============================================================================
+if timeframe.in_seconds(htfInput) <= timeframe.in_seconds(timeframe.period)
+    runtime.error("Higher timeframe must be greater than chart timeframe. Intended use: 5-minute chart with 15-minute HTF.")
+
+//=============================================================================
+// INDICATORS
+//=============================================================================
+// Non-repainting HTF EMA: request the previously confirmed HTF EMA value.
+[htfEma, htfEmaPrev] = request.security(
+     syminfo.tickerid,
+     htfInput,
+     [ta.ema(close, htfEmaLen)[1], ta.ema(close, htfEmaLen)[2]],
+     lookahead = barmerge.lookahead_on
+)
+
+float emaFast = ta.ema(close, fastEmaLen)
+float emaSlow = ta.ema(close, slowEmaLen)
+float vwapVal = ta.vwap(hlc3)
+float rsiVal  = ta.rsi(close, rsiLen)
+
+[diPlus, diMinus, adxVal] = ta.dmi(adxDiLen, adxSmooth)
+
+float atrVal = ta.atr(atrLen)
+float atrAvg = ta.sma(atrVal, atrMaLen)
+
+//=============================================================================
+// TIME / SESSION LOGIC
+//=============================================================================
+int marketStartMin = marketStartH * 60 + marketStartM
+int marketEndMin   = marketEndH * 60 + marketEndM
+int squareOffMin   = squareOffH * 60 + squareOffM
+
+int barCloseMin = hour(time_close, tzInput) * 60 + minute(time_close, tzInput)
+
+bool withinMarket = barCloseMin >= marketStartMin and barCloseMin <= marketEndMin
+bool entryWindow  = withinMarket and barCloseMin >= marketStartMin + avoidOpenMins and barCloseMin <= marketEndMin - avoidCloseMins and barCloseMin < squareOffMin
+bool squareOffNow = withinMarket and barCloseMin >= squareOffMin
+
+//=============================================================================
+// EXPIRY LOGIC
+//=============================================================================
+int configuredExpiryDOW = f_dow(expiryDayInput)
+bool isConfiguredExpiryDay = dayofweek == configuredExpiryDOW
+bool expiryAllowed = not (avoidExpiryDay and isConfiguredExpiryDay)
+
+float effRsiBull = math.min(80.0, rsiBullTh + (expiryDayMode and isConfiguredExpiryDay ? expiryRsiBoost : 0.0))
+float effRsiBear = math.max(20.0, rsiBearTh - (expiryDayMode and isConfiguredExpiryDay ? expiryRsiBoost : 0.0))
+float effAdxTh   = adxTh + (expiryDayMode and isConfiguredExpiryDay ? expiryAdxBoost : 0.0)
+
+//=============================================================================
+// DAILY STATE / RISK LOCK
+//=============================================================================
+bool newDay = not barstate.isfirst and ta.change(time("D")) != 0
+
+var int tradesToday = 0
+var float dayStartEquity = strategy.equity
+var bool dailyLocked = false
+var string dailyLockReason = "NONE"
+
+if newDay
+    tradesToday := 0
+    dayStartEquity := strategy.equity
+    dailyLocked := false
+    dailyLockReason := "NONE"
+
+float dayPnl = strategy.equity - dayStartEquity
+
+if not dailyLocked
+    if dailyMaxLoss > 0 and dayPnl <= -dailyMaxLoss
+        dailyLocked := true
+        dailyLockReason := "DAILY_MAX_LOSS"
+    else if dailyProfitLock > 0 and dayPnl >= dailyProfitLock
+        dailyLocked := true
+        dailyLockReason := "DAILY_PROFIT_LOCK"
+
+//=============================================================================
+// ACTIVE TRADE STATE
+//=============================================================================
+var float activeEntrySpot = na
+var float activeStopSpot = na
+var float activeTargetSpot = na
+var string activeOptionSide = "NONE"
+
+var int lastEntryBar = na
+var int lastExitBar = na
+var int lastLossExitBar = na
+var int closedTradesSeen = 0
+
+if strategy.closedtrades > closedTradesSeen
+    float lastTradeProfit = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    lastExitBar := bar_index
+    if lastTradeProfit < 0
+        lastLossExitBar := bar_index
+    closedTradesSeen := strategy.closedtrades
+
+bool justWentFlat = strategy.position_size == 0 and nz(strategy.position_size[1]) != 0
+
+if justWentFlat
+    activeEntrySpot := na
+    activeStopSpot := na
+    activeTargetSpot := na
+    activeOptionSide := "NONE"
+
+//=============================================================================
+// TREND / MOMENTUM CONDITIONS
+//=============================================================================
+bool htfSlopeUp   = not na(htfEma) and not na(htfEmaPrev) and htfEma > htfEmaPrev
+bool htfSlopeDown = not na(htfEma) and not na(htfEmaPrev) and htfEma < htfEmaPrev
+
+bool htfBull = close > htfEma and htfSlopeUp
+bool htfBear = close < htfEma and htfSlopeDown
+
+bool vwapBull = not useVWAP or close > vwapVal
+bool vwapBear = not useVWAP or close < vwapVal
+
+bool emaBull = emaFast > emaSlow
+bool emaBear = emaFast < emaSlow
+
+bool rsiBull = rsiVal > effRsiBull
+bool rsiBear = rsiVal < effRsiBear
+
+bool adxOk = adxVal >= effAdxTh
+bool atrOk = not useAtrChop or (not na(atrAvg) and atrVal >= atrAvg * minAtrVsAvg)
+
+//=============================================================================
+// CANDLE / ENTRY TRIGGER CONDITIONS
+//=============================================================================
+float barRange = high - low
+float bodySize = math.abs(close - open)
+float closeLocation = barRange > 0 ? (close - low) / barRange : 0.5
+
+bool candleNotHuge = not na(atrVal) and barRange <= atrVal * maxRangeAtr
+bool bodyOk = not na(atrVal) and bodySize >= atrVal * minBodyAtr
+
+bool bullishCandle = close > open and close > close[1] and close > emaFast and closeLocation >= closeStrength
+bool bearishCandle = close < open and close < close[1] and close < emaFast and closeLocation <= 1.0 - closeStrength
+
+bool longPullbackOrBreakout = low <= emaFast or close > high[1]
+bool shortPullbackOrBreakdown = high >= emaFast or close < low[1]
+
+bool longTrigger = bullishCandle and bodyOk and candleNotHuge and longPullbackOrBreakout
+bool shortTrigger = bearishCandle and bodyOk and candleNotHuge and shortPullbackOrBreakdown
+
+//=============================================================================
+// STOP / TARGET CALCULATION
+//=============================================================================
+float atrLongStop = close - atrVal * atrSlMult
+float atrShortStop = close + atrVal * atrSlMult
+
+float swingLongStop = ta.lowest(low, swingLookback) - atrVal * swingBufferAtr
+float swingShortStop = ta.highest(high, swingLookback) + atrVal * swingBufferAtr
+
+float longStopCandidate = switch stopMode
+    "ATR" => atrLongStop
+    "Swing" => swingLongStop
+    => math.min(atrLongStop, swingLongStop)
+
+float shortStopCandidate = switch stopMode
+    "ATR" => atrShortStop
+    "Swing" => swingShortStop
+    => math.max(atrShortStop, swingShortStop)
+
+float longRiskPts = close - longStopCandidate
+float shortRiskPts = shortStopCandidate - close
+
+bool validLongRisk = not na(longRiskPts) and longRiskPts > syminfo.mintick
+bool validShortRisk = not na(shortRiskPts) and shortRiskPts > syminfo.mintick
+
+float longTargetCandidate = close + longRiskPts * rrInput
+float shortTargetCandidate = close - shortRiskPts * rrInput
+
+//=============================================================================
+// RAW SIGNALS
+//=============================================================================
+bool rawLongSignal =
+     barstate.isconfirmed and
+     htfBull and
+     vwapBull and
+     emaBull and
+     rsiBull and
+     adxOk and
+     atrOk and
+     longTrigger and
+     validLongRisk
+
+bool rawShortSignal =
+     barstate.isconfirmed and
+     htfBear and
+     vwapBear and
+     emaBear and
+     rsiBear and
+     adxOk and
+     atrOk and
+     shortTrigger and
+     validShortRisk
+
+//=============================================================================
+// MANUAL EXIT CONDITIONS
+//=============================================================================
+bool longTrendInvalid = strategy.position_size > 0 and exitTrendInvalid and (not htfBull or emaFast < emaSlow or (useVWAP and close < vwapVal))
+bool shortTrendInvalid = strategy.position_size < 0 and exitTrendInvalid and (not htfBear or emaFast > emaSlow or (useVWAP and close > vwapVal))
+
+bool longOppositeExit = strategy.position_size > 0 and exitOnOpposite and not allowReversal and rawShortSignal
+bool shortOppositeExit = strategy.position_size < 0 and exitOnOpposite and not allowReversal and rawLongSignal
+
+bool longManualExit =
+     barstate.isconfirmed and
+     strategy.position_size > 0 and
+     (squareOffNow or dailyLocked or longTrendInvalid or longOppositeExit)
+
+bool shortManualExit =
+     barstate.isconfirmed and
+     strategy.position_size < 0 and
+     (squareOffNow or dailyLocked or shortTrendInvalid or shortOppositeExit)
+
+//=============================================================================
+// ENTRY PERMISSION FILTERS
+//=============================================================================
+bool tradeCooldownOk = na(lastExitBar) or bar_index - lastExitBar >= cooldownBars
+bool lossCooldownOk = na(lastLossExitBar) or bar_index - lastLossExitBar >= lossCooldownBars
+bool duplicateEntryOk = na(lastEntryBar) or bar_index > lastEntryBar
+
+bool commonEntryOk =
+     timeframe.isintraday and
+     entryWindow and
+     expiryAllowed and
+     not dailyLocked and
+     tradesToday < maxTradesDay and
+     duplicateEntryOk and
+     not longManualExit and
+     not shortManualExit
+
+bool longCooldownOk = (allowReversal and strategy.position_size < 0) or (tradeCooldownOk and lossCooldownOk)
+bool shortCooldownOk = (allowReversal and strategy.position_size > 0) or (tradeCooldownOk and lossCooldownOk)
+
+bool longPositionAllowed = strategy.position_size == 0 or (allowReversal and strategy.position_size < 0)
+bool shortPositionAllowed = strategy.position_size == 0 or (allowReversal and strategy.position_size > 0)
+
+bool buyCeSignal = rawLongSignal and commonEntryOk and longCooldownOk and longPositionAllowed
+bool buyPeSignal = rawShortSignal and commonEntryOk and shortCooldownOk and shortPositionAllowed
+
+//=============================================================================
+// STRATEGY STOP / TARGET ORDERS
+// Alerts are disabled here so all webhook JSON alerts come from alert() once per bar close.
+// Live webhook executor should place broker-side protective orders from entry JSON.
+//=============================================================================
+if strategy.position_size > 0 and not na(activeStopSpot) and not na(activeTargetSpot)
+    strategy.exit(
+         "CE_SL_TP",
+         from_entry = "BUY_CE",
+         stop = activeStopSpot,
+         limit = activeTargetSpot,
+         comment_profit = "TARGET HIT CE",
+         comment_loss = "STOP LOSS HIT CE",
+         disable_alert = true
+    )
+
+if strategy.position_size < 0 and not na(activeStopSpot) and not na(activeTargetSpot)
+    strategy.exit(
+         "PE_SL_TP",
+         from_entry = "BUY_PE",
+         stop = activeStopSpot,
+         limit = activeTargetSpot,
+         comment_profit = "TARGET HIT PE",
+         comment_loss = "STOP LOSS HIT PE",
+         disable_alert = true
+    )
+
+//=============================================================================
+// BAR-CLOSE STOP / TARGET ALERTS
+// These alerts are intentionally bar-close alerts. They are not a substitute for
+// broker-side stop orders in live option execution.
+//=============================================================================
+bool ceWasOpen = nz(strategy.position_size[1]) > 0
+bool peWasOpen = nz(strategy.position_size[1]) < 0
+
+float prevEntry = activeEntrySpot[1]
+float prevStop = activeStopSpot[1]
+float prevTarget = activeTargetSpot[1]
+
+bool ceStopTouched = barstate.isconfirmed and ceWasOpen and not na(prevStop) and low <= prevStop
+bool ceTargetTouched = barstate.isconfirmed and ceWasOpen and not ceStopTouched and not na(prevTarget) and high >= prevTarget
+
+bool peStopTouched = barstate.isconfirmed and peWasOpen and not na(prevStop) and high >= prevStop
+bool peTargetTouched = barstate.isconfirmed and peWasOpen and not peStopTouched and not na(prevTarget) and low <= prevTarget
+
+if ceStopTouched
+    string ceStopJson = f_json("STOP LOSS HIT", "LONG_EXIT", "CE", prevEntry, prevStop, prevTarget, "SPOT_STOP_LOSS_TOUCHED")
+    alert(ceStopJson, alert.freq_once_per_bar_close)
+
+if ceTargetTouched
+    string ceTargetJson = f_json("TARGET HIT", "LONG_EXIT", "CE", prevEntry, prevStop, prevTarget, "SPOT_TARGET_TOUCHED")
+    alert(ceTargetJson, alert.freq_once_per_bar_close)
+
+if peStopTouched
+    string peStopJson = f_json("STOP LOSS HIT", "SHORT_EXIT", "PE", prevEntry, prevStop, prevTarget, "SPOT_STOP_LOSS_TOUCHED")
+    alert(peStopJson, alert.freq_once_per_bar_close)
+
+if peTargetTouched
+    string peTargetJson = f_json("TARGET HIT", "SHORT_EXIT", "PE", prevEntry, prevStop, prevTarget, "SPOT_TARGET_TOUCHED")
+    alert(peTargetJson, alert.freq_once_per_bar_close)
+
+//=============================================================================
+// MANUAL EXITS
+//=============================================================================
+if longManualExit
+    string exitReason = squareOffNow ? "EOD_SQUARE_OFF" : dailyLocked ? dailyLockReason : longTrendInvalid ? "TREND_INVALIDATION" : "OPPOSITE_SIGNAL"
+    string exitSignalType = squareOffNow ? "SQUARE OFF" : "EXIT CE"
+    string exitJson = f_json(exitSignalType, "LONG_EXIT", "CE", activeEntrySpot, activeStopSpot, activeTargetSpot, exitReason)
+    strategy.close("BUY_CE", comment = exitReason, alert_message = exitJson, disable_alert = true)
+    alert(exitJson, alert.freq_once_per_bar_close)
+
+if shortManualExit
+    string exitReason = squareOffNow ? "EOD_SQUARE_OFF" : dailyLocked ? dailyLockReason : shortTrendInvalid ? "TREND_INVALIDATION" : "OPPOSITE_SIGNAL"
+    string exitSignalType = squareOffNow ? "SQUARE OFF" : "EXIT PE"
+    string exitJson = f_json(exitSignalType, "SHORT_EXIT", "PE", activeEntrySpot, activeStopSpot, activeTargetSpot, exitReason)
+    strategy.close("BUY_PE", comment = exitReason, alert_message = exitJson, disable_alert = true)
+    alert(exitJson, alert.freq_once_per_bar_close)
+
+//=============================================================================
+// ENTRIES
+//=============================================================================
+if buyCeSignal and not buyPeSignal
+    if strategy.position_size < 0
+        string revExitJson = f_json("EXIT PE", "SHORT_EXIT", "PE", activeEntrySpot, activeStopSpot, activeTargetSpot, "REVERSAL_TO_CE")
+        alert(revExitJson, alert.freq_once_per_bar_close)
+
+    activeEntrySpot := close
+    activeStopSpot := longStopCandidate
+    activeTargetSpot := longTargetCandidate
+    activeOptionSide := "CE"
+
+    string buyJson = f_json("BUY CE", "LONG", "CE", activeEntrySpot, activeStopSpot, activeTargetSpot, "HTF_BULLISH_VWAP_EMA_RSI_ADX_ATR_MOMENTUM")
+    strategy.entry("BUY_CE", strategy.long, comment = "BUY CE", alert_message = buyJson, disable_alert = true)
+    alert(buyJson, alert.freq_once_per_bar_close)
+
+    tradesToday += 1
+    lastEntryBar := bar_index
+
+if buyPeSignal and not buyCeSignal
+    if strategy.position_size > 0
+        string revExitJson = f_json("EXIT CE", "LONG_EXIT", "CE", activeEntrySpot, activeStopSpot, activeTargetSpot, "REVERSAL_TO_PE")
+        alert(revExitJson, alert.freq_once_per_bar_close)
+
+    activeEntrySpot := close
+    activeStopSpot := shortStopCandidate
+    activeTargetSpot := shortTargetCandidate
+    activeOptionSide := "PE"
+
+    string buyJson = f_json("BUY PE", "SHORT", "PE", activeEntrySpot, activeStopSpot, activeTargetSpot, "HTF_BEARISH_VWAP_EMA_RSI_ADX_ATR_MOMENTUM")
+    strategy.entry("BUY_PE", strategy.short, comment = "BUY PE", alert_message = buyJson, disable_alert = true)
+    alert(buyJson, alert.freq_once_per_bar_close)
+
+    tradesToday += 1
+    lastEntryBar := bar_index
+
+//=============================================================================
+// PLOTS
+//=============================================================================
+plot(emaFast, "EMA 9 / Fast EMA", color = color.new(color.teal, 0), linewidth = 1)
+plot(emaSlow, "EMA 21 / Slow EMA", color = color.new(color.orange, 0), linewidth = 1)
+plot(useVWAP ? vwapVal : na, "VWAP", color = color.new(color.blue, 0), linewidth = 2)
+plot(showHTFEMA ? htfEma : na, "Confirmed HTF EMA", color = htfBull ? color.new(color.green, 0) : htfBear ? color.new(color.red, 0) : color.new(color.gray, 0), linewidth = 2)
+
+plot(showTradeLevels and strategy.position_size != 0 ? activeStopSpot : na, "Active Spot Stop", color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 2)
+plot(showTradeLevels and strategy.position_size != 0 ? activeTargetSpot : na, "Active Spot Target", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 2)
+
+bgcolor(showBiasBg ? (htfBull ? color.new(color.green, 92) : htfBear ? color.new(color.red, 92) : na) : na)
+
+plotshape(showMarkers and buyCeSignal, title = "BUY CE", text = "BUY CE", style = shape.labelup, location = location.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
+plotshape(showMarkers and buyPeSignal, title = "BUY PE", text = "BUY PE", style = shape.labeldown, location = location.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
+
+plotshape(showMarkers and longManualExit, title = "EXIT CE", text = "EXIT CE", style = shape.labeldown, location = location.abovebar, color = color.new(color.orange, 0), textcolor = color.white, size = size.tiny)
+plotshape(showMarkers and shortManualExit, title = "EXIT PE", text = "EXIT PE", style = shape.labelup, location = location.belowbar, color = color.new(color.orange, 0), textcolor = color.white, size = size.tiny)
+
+plotshape(showMarkers and ceStopTouched, title = "CE Stop", text = "SL CE", style = shape.xcross, location = location.belowbar, color = color.new(color.red, 0), textcolor = color.white, size = size.tiny)
+plotshape(showMarkers and ceTargetTouched, title = "CE Target", text = "TG CE", style = shape.diamond, location = location.abovebar, color = color.new(color.green, 0), textcolor = color.white, size = size.tiny)
+plotshape(showMarkers and peStopTouched, title = "PE Stop", text = "SL PE", style = shape.xcross, location = location.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.tiny)
+plotshape(showMarkers and peTargetTouched, title = "PE Target", text = "TG PE", style = shape.diamond, location = location.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.tiny)
+
+//=============================================================================
+// DASHBOARD
+//=============================================================================
+var table dash = table.new(position.top_right, 2, 12, border_width = 1)
+
+f_row(int row, string name, string value, color valueBg) =>
+    table.cell(dash, 0, row, name, bgcolor = color.new(color.black, 5), text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, row, value, bgcolor = valueBg, text_color = color.white, text_size = size.small)
+
+if barstate.islast and showDashboard
+    string biasTxt = htfBull ? "Bullish CE bias" : htfBear ? "Bearish PE bias" : "Neutral / chop"
+    color biasBg = htfBull ? color.new(color.green, 0) : htfBear ? color.new(color.red, 0) : color.new(color.gray, 30)
+
+    string activeTxt = strategy.position_size > 0 ? "BUY CE active" : strategy.position_size < 0 ? "BUY PE active" : "Flat"
+    color activeBg = strategy.position_size > 0 ? color.new(color.green, 0) : strategy.position_size < 0 ? color.new(color.red, 0) : color.new(color.gray, 30)
+
+    string sessionTxt = entryWindow ? "Entry allowed" : squareOffNow ? "Square-off zone" : withinMarket ? "Time blocked" : "Outside market"
+    color sessionBg = entryWindow ? color.new(color.green, 0) : color.new(color.orange, 0)
+
+    string expiryTxt = isConfiguredExpiryDay ? (avoidExpiryDay ? "Expiry blocked" : expiryDayMode ? "Expiry mode ON" : "Expiry day") : "Normal day"
+    color expiryBg = avoidExpiryDay and isConfiguredExpiryDay ? color.new(color.red, 0) : isConfiguredExpiryDay ? color.new(color.orange, 0) : color.new(color.gray, 30)
+
+    string sideTxt = htfBull and vwapBull ? "CE" : htfBear and vwapBear ? "PE" : "None"
+    color sideBg = sideTxt == "CE" ? color.new(color.green, 0) : sideTxt == "PE" ? color.new(color.red, 0) : color.new(color.gray, 30)
+
+    f_row(0, "NIFTY bias", biasTxt, biasBg)
+    f_row(1, "Active trade", activeTxt, activeBg)
+    f_row(2, "RSI", str.tostring(rsiVal, "#.##") + " / CE>" + str.tostring(effRsiBull, "#.#") + " PE<" + str.tostring(effRsiBear, "#.#"), rsiBull ? color.new(color.green, 0) : rsiBear ? color.new(color.red, 0) : color.new(color.gray, 30))
+    f_row(3, "ADX", str.tostring(adxVal, "#.##") + " / min " + str.tostring(effAdxTh, "#.#"), adxOk ? color.new(color.green, 0) : color.new(color.orange, 0))
+    f_row(4, "ATR condition", atrOk ? "OK" : "Low-vol chop", atrOk ? color.new(color.green, 0) : color.new(color.orange, 0))
+    f_row(5, "Trades today", str.tostring(tradesToday) + " / " + str.tostring(maxTradesDay), tradesToday < maxTradesDay ? color.new(color.green, 0) : color.new(color.red, 0))
+    f_row(6, "Risk reward", "1 : " + str.tostring(rrInput, "#.##"), color.new(color.blue, 20))
+    f_row(7, "Session", sessionTxt, sessionBg)
+    f_row(8, "Expiry status", expiryTxt, expiryBg)
+    f_row(9, "Suggested side", sideTxt, sideBg)
+    f_row(10, "Strike note", strikeInstructionText, color.new(color.purple, 20))
+    f_row(11, "Day P&L lock", dailyLocked ? dailyLockReason : str.tostring(dayPnl, "#.##"), dailyLocked ? color.new(color.red, 0) : color.new(color.gray, 30))

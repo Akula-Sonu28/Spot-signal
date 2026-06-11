@@ -1,0 +1,198 @@
+//@version=6
+// =============================================================================
+// STRATEGY 3: SUPERTREND FLIP + VOLUME — NIFTY Intraday
+// =============================================================================
+// BUY CE: Supertrend flips bullish AND volume > 20-bar avg
+// BUY PE: Supertrend flips bearish AND volume > 20-bar avg
+// Stop: Supertrend line | Target: 2x entry-to-ST distance
+// =============================================================================
+
+strategy(
+     "NIFTY S3 — Supertrend + Volume",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 100000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 100,
+     commission_type = strategy.commission.cash_per_order,
+     commission_value = 40,
+     slippage = 2,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     max_bars_back = 500,
+     currency = currency.INR
+)
+
+const string grpInd     = "Indicators"
+const string grpRisk    = "Risk"
+const string grpSession = "Session"
+const string grpOption  = "Options"
+const string grpVisual  = "Visuals"
+
+int stAtrLen       = input.int(10, "Supertrend ATR length", minval = 1, group = grpInd)
+float stFactor     = input.float(2.0, "Supertrend multiplier", minval = 0.5, step = 0.1, group = grpInd)
+int volAvgLen      = input.int(20, "Volume SMA length", minval = 5, group = grpInd)
+
+float rrRatio      = input.float(1.5, "Risk-Reward ratio", minval = 0.5, maxval = 5.0, step = 0.1, group = grpRisk)
+
+string tzInput     = input.string("Asia/Kolkata", "Timezone", group = grpSession)
+int skipOpenMins   = input.int(15, "Skip first X minutes after open", minval = 0, maxval = 60, group = grpSession)
+int squareOffH     = input.int(15, "Square-off hour", minval = 9, maxval = 15, group = grpSession)
+int squareOffM     = input.int(15, "Square-off minute", minval = 0, maxval = 59, group = grpSession)
+int maxTradesDay   = input.int(2, "Max trades per day", minval = 1, maxval = 5, group = grpSession)
+
+string strikePref  = input.string("ATM or 1-step ITM", "Strike preference", group = grpOption)
+string expiryInstr = input.string("Current weekly expiry.", "Expiry note", group = grpOption)
+string premiumInstr = input.string("Use 40-50% premium SL for live options.", "Premium note", group = grpOption)
+
+bool showST        = input.bool(true, "Plot Supertrend", group = grpVisual)
+bool showLevels    = input.bool(true, "Show SL/Target", group = grpVisual)
+bool showDash      = input.bool(true, "Show dashboard", group = grpVisual)
+bool showMarkers   = input.bool(true, "Show markers", group = grpVisual)
+
+f_safe(string txt) =>
+    str.replace_all(txt, "\"", "'")
+
+f_num(float x) =>
+    na(x) ? "null" : str.tostring(x, format.mintick)
+
+f_json(string sig, string dir, string optSide, float ep, float sl, float tp, string reason) =>
+    string r = "{\"signal\":\"" + f_safe(sig) + "\","
+    r += "\"direction\":\"" + f_safe(dir) + "\","
+    r += "\"underlying\":\"" + f_safe(syminfo.tickerid) + "\","
+    r += "\"option_side\":\"" + f_safe(optSide) + "\","
+    r += "\"strike\":\"" + f_safe(strikePref) + "\","
+    r += "\"expiry\":\"" + f_safe(expiryInstr) + "\","
+    r += "\"tf\":\"" + f_safe(timeframe.period) + "\","
+    r += "\"entry\":" + f_num(ep) + ","
+    r += "\"sl\":" + f_num(sl) + ","
+    r += "\"target\":" + f_num(tp) + ","
+    r += "\"premium_note\":\"" + f_safe(premiumInstr) + "\","
+    r += "\"rr\":" + str.tostring(rrRatio, "#.#") + ","
+    r += "\"ts\":\"" + str.format_time(time_close, "yyyy-MM-dd HH:mm:ss", tzInput) + "\","
+    r += "\"reason\":\"" + f_safe(reason) + "\"}"
+    r
+
+// --- Supertrend ---
+[supertrend, direction] = ta.supertrend(stFactor, stAtrLen)
+bool stBullish = direction < 0
+bool stBearish = direction > 0
+bool stFlipBull = stBullish and not stBullish[1]
+bool stFlipBear = stBearish and not stBearish[1]
+
+float volAvg = ta.sma(volume, volAvgLen)
+bool volOk = nz(volume, 0) == 0 or volume >= volAvg
+
+float vwapVal = ta.vwap(hlc3)
+bool vwapLongOk = close > vwapVal
+bool vwapShortOk = close < vwapVal
+
+// --- Time ---
+int barMin = hour(time_close, tzInput) * 60 + minute(time_close, tzInput)
+int marketOpen = 9 * 60 + 15
+int entryStart = marketOpen + skipOpenMins
+int sqOffMin = squareOffH * 60 + squareOffM
+
+bool isEntryWindow = barMin >= entryStart and barMin < sqOffMin
+bool isSquareOff = barMin >= sqOffMin
+
+// --- Daily state ---
+var int tradesToday = 0
+bool isDayChange = ta.change(time("D")) != 0
+
+if isDayChange
+    tradesToday := 0
+
+var float activeEntry = na
+var float activeStop = na
+var float activeTarget = na
+var int lastEntryBar = na
+
+bool isFlat = strategy.position_size == 0
+bool justWentFlat = strategy.position_size == 0 and nz(strategy.position_size[1]) != 0
+
+if justWentFlat
+    activeEntry := na
+    activeStop := na
+    activeTarget := na
+
+// --- Signals ---
+bool longSignal = barstate.isconfirmed and isEntryWindow and stFlipBull and volOk and vwapLongOk and tradesToday < maxTradesDay and isFlat
+bool shortSignal = barstate.isconfirmed and isEntryWindow and stFlipBear and volOk and vwapShortOk and tradesToday < maxTradesDay and isFlat
+
+float longStop = supertrend
+float shortStop = supertrend
+float longRisk = close - longStop
+float shortRisk = shortStop - close
+float longTarget = longRisk > 0 ? close + longRisk * rrRatio : na
+float shortTarget = shortRisk > 0 ? close - shortRisk * rrRatio : na
+
+// --- Exits: trailing Supertrend stop only (no fixed target) ---
+if strategy.position_size > 0
+    activeStop := math.max(nz(activeStop, supertrend), supertrend)
+    strategy.exit("CE_EXIT", from_entry = "BUY_CE", stop = activeStop, disable_alert = true)
+
+if strategy.position_size < 0
+    activeStop := math.min(nz(activeStop, supertrend), supertrend)
+    strategy.exit("PE_EXIT", from_entry = "BUY_PE", stop = activeStop, disable_alert = true)
+
+if barstate.isconfirmed and isSquareOff and strategy.position_size != 0
+    string side = strategy.position_size > 0 ? "CE" : "PE"
+    string dir = strategy.position_size > 0 ? "LONG_EXIT" : "SHORT_EXIT"
+    string sqJson = f_json("SQUARE_OFF", dir, side, activeEntry, activeStop, activeTarget, "EOD")
+    strategy.close_all(comment = "SQ OFF", alert_message = sqJson, disable_alert = true)
+    alert(sqJson, alert.freq_once_per_bar_close)
+
+// --- Entries ---
+if longSignal and longRisk > 0
+    activeEntry := close
+    activeStop := longStop
+    activeTarget := longTarget
+    string buyJson = f_json("BUY_CE", "LONG", "CE", activeEntry, activeStop, activeTarget, "SUPERTREND_FLIP_BULL_VWAP")
+    strategy.entry("BUY_CE", strategy.long, comment = "BUY CE", alert_message = buyJson, disable_alert = true)
+    alert(buyJson, alert.freq_once_per_bar_close)
+    tradesToday += 1
+    lastEntryBar := bar_index
+
+if shortSignal and shortRisk > 0
+    activeEntry := close
+    activeStop := shortStop
+    activeTarget := shortTarget
+    string buyJson = f_json("BUY_PE", "SHORT", "PE", activeEntry, activeStop, activeTarget, "SUPERTREND_FLIP_BEAR_VWAP")
+    strategy.entry("BUY_PE", strategy.short, comment = "BUY PE", alert_message = buyJson, disable_alert = true)
+    alert(buyJson, alert.freq_once_per_bar_close)
+    tradesToday += 1
+    lastEntryBar := bar_index
+
+// --- Plots ---
+color stColor = stBullish ? color.green : color.red
+plot(showST ? supertrend : na, "Supertrend", color = stColor, linewidth = 2, style = plot.style_linebr)
+plot(showLevels and strategy.position_size != 0 ? activeStop : na, "SL", color = color.red, style = plot.style_linebr, linewidth = 2)
+plot(showLevels and strategy.position_size != 0 ? activeTarget : na, "Target", color = color.green, style = plot.style_linebr, linewidth = 2)
+
+plotshape(showMarkers and longSignal, title = "CE", text = "CE", style = shape.labelup, location = location.belowbar, color = color.green, textcolor = color.white, size = size.small)
+plotshape(showMarkers and shortSignal, title = "PE", text = "PE", style = shape.labeldown, location = location.abovebar, color = color.red, textcolor = color.white, size = size.small)
+
+// --- Dashboard ---
+var table dash = table.new(position.top_right, 2, 6, border_width = 1)
+
+f_row(int row, string lbl, string val, color bg) =>
+    table.cell(dash, 0, row, lbl, bgcolor = color.new(color.black, 5), text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, row, val, bgcolor = bg, text_color = color.white, text_size = size.small)
+
+if barstate.islast and showDash
+    string stTxt = stBullish ? "Bullish" : "Bearish"
+    color stBg = stBullish ? color.new(color.green, 0) : color.new(color.red, 0)
+    string volTxt = volOk ? "Vol OK" : "Low vol"
+    color volBg = volOk ? color.new(color.green, 0) : color.new(color.orange, 0)
+    string posTxt = strategy.position_size > 0 ? "LONG/CE" : strategy.position_size < 0 ? "SHORT/PE" : "Flat"
+    string sessTxt = isEntryWindow ? "Live" : isSquareOff ? "Square-off" : "Closed"
+    f_row(0, "Supertrend", stTxt, stBg)
+    f_row(1, "Volume", volTxt, volBg)
+    f_row(2, "Position", posTxt, color.new(color.gray, 30))
+    f_row(3, "Session", sessTxt, isEntryWindow ? color.new(color.green, 0) : color.new(color.orange, 0))
+    f_row(4, "Trades", str.tostring(tradesToday) + "/" + str.tostring(maxTradesDay), color.new(color.gray, 30))
+    f_row(5, "ST Value", str.tostring(supertrend, "#.##"), color.new(color.gray, 30))
+
+alertcondition(longSignal, title = "BUY CE", message = "Supertrend flip bullish — BUY CE")
+alertcondition(shortSignal, title = "BUY PE", message = "Supertrend flip bearish — BUY PE")

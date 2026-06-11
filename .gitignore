@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+# Ephemeral runtime locks/logs (regenerated each session)
+data/live/market-session.lock
+data/live/telegram_offset.json
+data/live/force_tick.request
+data/live/launchd.out.log
+data/live/launchd.err.log
+data/live/telegram-remote.out.log
+data/live/telegram-remote.err.log
+# Research backtest outputs (timestamped runs)
+research/backtests/options_setups_comparison/outputs/

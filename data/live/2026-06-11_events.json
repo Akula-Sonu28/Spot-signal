@@ -1,0 +1,33 @@
+[
+  {
+    "timestamp": "2026-06-11T09:45:00+05:30",
+    "event_type": "BUY_CE",
+    "direction": "LONG",
+    "side": "CE",
+    "price": 23151.75,
+    "stop": 23112.997959909295,
+    "target": 23221.503672163268,
+    "reason": "ORB_BREAKOUT+VWAP+ADX",
+    "bar_index": 231,
+    "extra": {
+      "or_high": 23148.05,
+      "or_low": 23072.05,
+      "adx": 51.0494933160756,
+      "vwap": 23124.64730636677
+    }
+  },
+  {
+    "timestamp": "2026-06-11T09:55:00+05:30",
+    "event_type": "SL_CE",
+    "direction": "LONG_EXIT",
+    "side": "CE",
+    "price": 23112.997959909295,
+    "stop": 23112.997959909295,
+    "target": 23221.503672163268,
+    "reason": "STOP_HIT",
+    "bar_index": 233,
+    "extra": {
+      "entry": 23151.75
+    }
+  }
+]

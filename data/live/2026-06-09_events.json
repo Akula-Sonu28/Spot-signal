@@ -1,0 +1,64 @@
+[
+  {
+    "timestamp": "2026-06-09T09:45:00+05:30",
+    "event_type": "BUY_PE",
+    "direction": "SHORT",
+    "side": "PE",
+    "price": 23184.9,
+    "stop": 23221.76835463998,
+    "target": 23118.536961648042,
+    "reason": "ORB_BREAKDOWN+VWAP+ADX",
+    "bar_index": 231,
+    "extra": {
+      "or_high": 23259.45,
+      "or_low": 23194.9,
+      "adx": 27.71459309778819,
+      "vwap": 23208.015424778765
+    }
+  },
+  {
+    "timestamp": "2026-06-09T11:20:00+05:30",
+    "event_type": "TARGET_PE",
+    "direction": "SHORT_EXIT",
+    "side": "PE",
+    "price": 23118.536961648042,
+    "stop": 23221.76835463998,
+    "target": 23118.536961648042,
+    "reason": "TARGET_HIT",
+    "bar_index": 250,
+    "extra": {
+      "entry": 23184.9
+    }
+  },
+  {
+    "timestamp": "2026-06-09T14:50:00+05:30",
+    "event_type": "BUY_CE",
+    "direction": "LONG",
+    "side": "CE",
+    "price": 23267.25,
+    "stop": 23242.7977650823,
+    "target": 23311.264022851858,
+    "reason": "ORB_BREAKOUT+VWAP+ADX",
+    "bar_index": 292,
+    "extra": {
+      "or_high": 23259.45,
+      "or_low": 23194.9,
+      "adx": 20.131382559404575,
+      "vwap": 23172.76352133348
+    }
+  },
+  {
+    "timestamp": "2026-06-09T15:00:00+05:30",
+    "event_type": "SL_CE",
+    "direction": "LONG_EXIT",
+    "side": "CE",
+    "price": 23242.7977650823,
+    "stop": 23242.7977650823,
+    "target": 23311.264022851858,
+    "reason": "STOP_HIT",
+    "bar_index": 294,
+    "extra": {
+      "entry": 23267.25
+    }
+  }
+]
