@@ -4,34 +4,50 @@ Complete setup for running the NIFTY Spot Signal Engine on Windows 10/11.
 
 Phase 1 is **alerts only** — no broker orders (`AUTO_TRADE` is hardcoded `False`).
 
+This guide matches the **production Windows stack** in the repo: hidden background tasks, duplicate-instance guards, SSL fallback for corporate networks, and enhanced Telegram messages.
+
 ## What runs on Windows
 
 | Component | Path | Role |
 |-----------|------|------|
-| Core bot | `python -m bot.main` | Live signal engine |
-| Telegram remote | `python -m bot.telegram_remote` | `/start`, `/stop`, `/status`, `/tick` |
-| Session wrapper | `scripts/run_market_session.ps1` | Starts bot, prevents sleep, writes lock/log |
-| Remote wrapper | `scripts/run_telegram_remote.ps1` | Always-on Telegram listener |
-| Task installer | `scripts/install_windows_task.ps1` | Schedules both jobs |
-| Process control | `bot/platform_paths.py` | PowerShell launch, `taskkill` on stop |
+| Core bot | `py -m bot.main` or `python -m bot.main` | Live signal engine |
+| Telegram remote | `py -m bot.telegram_remote` | `/start`, `/stop`, `/status`, `/tick` |
+| Session wrapper | `scripts/run_market_session.ps1` | Starts bot, prevents sleep, lock/log, crash safety-net |
+| Remote wrapper | `scripts/run_telegram_remote.ps1` | Always-on Telegram listener (single-instance lock) |
+| Task installer | `scripts/install_windows_task.ps1` | Registers both tasks, starts Telegram immediately |
+| Process control | `bot/platform_paths.py` | Hidden PowerShell launch, `taskkill` on stop |
 
 **macOS-only (ignore on Windows):** `scripts/*.sh`, `install_launchd.sh`, `com.nifty-spot-signal-engine.*.plist`
+
+## Production features (built in)
+
+| Feature | Where | What it does |
+|---------|-------|--------------|
+| Hidden background | `install_windows_task.ps1`, `platform_paths.py` | No PowerShell popups; runs with `-WindowStyle Hidden` |
+| `py` launcher fallback | `run_*.ps1` | Uses `NIFTY_PYTHON` → `py` → `python` automatically |
+| Duplicate guard | `run_telegram_remote.ps1` | `telegram-remote.lock` — only one Telegram poller per bot token |
+| Single task instance | `install_windows_task.ps1` | `MultipleInstances: IgnoreNew` on scheduled tasks |
+| Auto-restart | Telegram task | Restarts up to 999 times if the remote listener crashes |
+| SSL fallback | `alerts.py`, `futures_vwap.py` | Retries HTTPS without cert verify (corporate proxy fix) |
+| Crash safety-net | `run_market_session.ps1` | Sends Telegram “session ended unexpectedly” if bot dies without a clean stop |
+| Rich `/status` | `telegram_commands.py` | Human-readable session, OR, trades, position |
+| Rich trade alerts | `alerts.py` | Breakout distance, R:R, ADX/VWAP/ATR, option OI/spread, P&L on exits |
 
 ## Architecture
 
 ```
-Task Scheduler (logon)
-    └── run_telegram_remote.ps1
-            └── python -m bot.telegram_remote
-                    └── /start launches run_market_session.ps1 via PowerShell
+Task Scheduler (logon) — hidden, no window
+    └── run_telegram_remote.ps1  [telegram-remote.lock]
+            └── py/python -m bot.telegram_remote
+                    └── /start → run_market_session.ps1 (hidden)
 
-Task Scheduler (Mon–Fri 09:10 IST)
-    └── run_market_session.ps1
+Task Scheduler (Mon–Fri 09:10) — hidden, no window
+    └── run_market_session.ps1  [market-session.lock]
             ├── SetThreadExecutionState (prevent sleep)
-            └── python -m bot.main
-                    ├── Upstox REST polling
+            └── py/python -m bot.main
+                    ├── Upstox REST (SSL fallback)
                     ├── strategy.py (v3.7 rules)
-                    └── Telegram alerts
+                    └── Telegram alerts (enhanced formatting)
 ```
 
 ## Prerequisites
@@ -42,28 +58,35 @@ Download from [python.org](https://www.python.org/downloads/windows/). During in
 
 - **Add python.exe to PATH**
 - **Install pip**
+- **Install py launcher** (usually included)
 
 Verify in PowerShell:
 
 ```powershell
+py --version
 python --version
 pip --version
 ```
 
-If `python` is not found but `py` works, set a persistent override:
+Scripts auto-pick: `NIFTY_PYTHON` env var → `py` → `python`. Override only if needed:
 
 ```powershell
-[System.Environment]::SetEnvironmentVariable("NIFTY_PYTHON", "py", "User")
+[System.Environment]::SetEnvironmentVariable(
+    "NIFTY_PYTHON",
+    "C:\Users\YOU\AppData\Local\Programs\Python\Python312\python.exe",
+    "User"
+)
 ```
 
-Or use the full path to `python.exe`. Restart PowerShell after changing `NIFTY_PYTHON`.
+Restart PowerShell after changing `NIFTY_PYTHON`.
 
 ### Project folder
 
 ```powershell
 cd C:\Users\YOU\Projects
-git clone <your-repo-url> Spot-signal
+git clone https://github.com/Akula-Sonu28/Spot-signal.git
 cd Spot-signal
+git pull origin main
 ```
 
 Prefer paths without spaces (e.g. `C:\Projects\Spot-signal`).
@@ -72,8 +95,8 @@ Prefer paths without spaces (e.g. `C:\Projects\Spot-signal`).
 
 ```powershell
 cd C:\Projects\Spot-signal
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+py -m pip install --upgrade pip
+py -m pip install -r requirements.txt
 ```
 
 `tzdata` is required on Windows for `Asia/Kolkata` timezone support.
@@ -111,15 +134,15 @@ cd C:\Projects\Spot-signal
 ### Test 1 — Config and Telegram
 
 ```powershell
-python -m bot.main --once
+py -m bot.main --once
 ```
 
-Expected: startup Telegram message and `Single tick complete.` on the console.
+Expected: enhanced startup Telegram message and `Single tick complete.` on the console.
 
 ### Test 2 — Test suite (optional)
 
 ```powershell
-python -m pytest tests/ -v
+py -m pytest tests/ -v
 ```
 
 ### Test 3 — Telegram remote (manual)
@@ -131,6 +154,8 @@ powershell -ExecutionPolicy Bypass -File scripts\run_telegram_remote.ps1
 ```
 
 You should receive: **Remote control online**. Send `/help` and `/status` in Telegram.
+
+Running it a second time should log `SKIP already running` (duplicate guard).
 
 ### Test 4 — Market session (manual)
 
@@ -153,29 +178,30 @@ Stop with Ctrl+C or `/stop` in Telegram.
 ### Test 5 — Upstox validation (optional)
 
 ```powershell
-python scripts\check_today.py
+py scripts\check_today.py
 ```
 
-## Install automatic scheduling
+## Install automatic scheduling (recommended)
 
-Creates two Windows tasks:
+Creates two **hidden background** Windows tasks:
 
 | Task name | When | What |
 |-----------|------|------|
-| `NiftySpotSignalEngine` | Mon–Fri 09:10 IST | Market session until ~15:30 IST |
+| `NiftySpotSignalEngine` | Mon–Fri 09:10 | Market session until ~15:30 IST |
 | `NiftySpotSignalEngineTelegram` | At user logon | Always-on Telegram remote (auto-restarts on failure) |
+
+Open **PowerShell as Administrator** (installer comment recommends elevated shell), then:
 
 ```powershell
 cd C:\Projects\Spot-signal
 powershell -ExecutionPolicy Bypass -File scripts\install_windows_task.ps1
 ```
 
-Verify:
+The installer will:
 
-```powershell
-Get-ScheduledTask -TaskName NiftySpotSignalEngine, NiftySpotSignalEngineTelegram |
-    Format-Table TaskName, State
-```
+1. Register both tasks (hidden, no popup windows)
+2. Verify task state and next run time
+3. **Start the Telegram remote immediately** — check Telegram for “Remote control online”
 
 ### Verify timezone (critical)
 
@@ -185,7 +211,7 @@ Get-ScheduledTask -TaskName NiftySpotSignalEngine, NiftySpotSignalEngineTelegram
 
 Wrong timezone = signals at the wrong local time.
 
-### Test tasks immediately
+### Test tasks manually
 
 ```powershell
 Start-ScheduledTask -TaskName NiftySpotSignalEngineTelegram
@@ -216,18 +242,28 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall_windows_task.ps1
 | Command | Action |
 |---------|--------|
 | `/help` | List commands |
-| `/status` | Bot state, position, last candle |
+| `/status` | Rich dashboard: time, window state, OR, trades, position |
 | `/start` | Start market session (09:15–15:30 IST only) |
 | `/stop` | Stop running session |
 | `/tick` | Force one poll (~20s, session must be running) |
 
-## Log files
+### What you’ll see in Telegram
+
+- **Bot started** — session info, max trades, waiting for OR
+- **OR ready** — high/low, width quality (Narrow/Good/Wide), CE/PE trigger prices
+- **BUY CE/PE** — breakout distance, risk/reward, ADX/VWAP/ATR, option ask/OI/spread
+- **SL / Target** — spot P&L in pts and %, option reference levels
+- **Square off** — P&L + “close option NOW” instruction
+
+## Log and lock files
 
 | File | Contents |
 |------|----------|
 | `data\live\market-session.log` | Market bot output |
-| `data\live\telegram-remote.out.log` | Telegram remote stdout |
+| `data\live\market-session.lock` | PowerShell PID while session runs |
+| `data\live\telegram-remote.out.log` | Telegram remote stdout + start/end lines |
 | `data\live\telegram-remote.err.log` | Telegram remote errors |
+| `data\live\telegram-remote.lock` | Prevents duplicate remote instances |
 | `data\live\signals.csv` | Signal event log |
 | `data\live\monitor_state.json` | Position / OR state |
 
@@ -241,32 +277,36 @@ Get-Content data\live\market-session.log -Wait -Tail 30
 
 | Symptom | Fix |
 |---------|-----|
-| `'python' is not recognized` | Reinstall Python with “Add to PATH”, or set `NIFTY_PYTHON` |
+| `'python' is not recognized` | Install Python with PATH + py launcher; or set `NIFTY_PYTHON` |
 | `Config error: UPSTOX_ACCESS_TOKEN` | Fill `.env`; run from project root |
-| `ZoneInfoNotFoundError: Asia/Kolkata` | `pip install tzdata` |
+| `ZoneInfoNotFoundError: Asia/Kolkata` | `py -m pip install tzdata` |
 | No Telegram messages | Check token and chat ID; message the bot first |
-| `Remote control error` in Telegram | Only one remote instance per bot token |
+| `Remote control error` in Telegram | Only one remote instance — check `telegram-remote.lock` |
+| SSL / certificate errors | Built-in fallback should handle this; check corporate proxy |
 | Task runs but nothing happens | Check `data\live\*.log`; confirm you are logged in |
 | Wrong signal times | Set Task Scheduler timezone to IST |
 | Upstox errors in log | Token expired — refresh in Upstox portal and `.env` |
 | Script blocked by policy | Use `-ExecutionPolicy Bypass` (installer already does) |
 | `/status` says STOPPED but bot runs | Delete stale `data\live\market-session.lock` |
 | Missed 09:10 start (PC was asleep) | Task uses `StartWhenAvailable` — starts when PC wakes if logged in |
+| Unexpected “session ended” Telegram | Crash safety-net fired — check `market-session.log` |
+| Second remote won’t start | Expected — duplicate guard; one listener per bot token |
 
 ## Windows caveats
 
 1. **You must be logged in** — tasks use `LogonType Interactive`. Screen lock is OK; full logout is not.
-2. **One Telegram listener only** — never run `run_telegram_remote.ps1` twice.
-3. **Lock file stores the PowerShell PID** — `/stop` uses `taskkill /T /F` to stop the wrapper and Python child.
-4. **Upstox token expires** — update `.env` when API calls fail.
-5. **Power settings** — use “Never sleep” on AC power, or rely on built-in sleep prevention during sessions.
+2. **One Telegram listener only** — enforced by `telegram-remote.lock` and `MultipleInstances: IgnoreNew`.
+3. **Everything runs hidden** — no PowerShell windows after install; check logs and Telegram instead.
+4. **Lock file stores the PowerShell PID** — `/stop` uses `taskkill /T /F` to stop the wrapper and Python child.
+5. **Upstox token expires** — update `.env` when API calls fail.
+6. **Power settings** — use “Never sleep” on AC power, or rely on built-in sleep prevention during sessions.
 
 ## Quick reference
 
 ```powershell
 cd C:\Projects\Spot-signal
 
-python -m bot.main --once
+py -m bot.main --once
 
 powershell -ExecutionPolicy Bypass -File scripts\run_telegram_remote.ps1
 powershell -ExecutionPolicy Bypass -File scripts\run_market_session.ps1
@@ -275,6 +315,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install_windows_task.ps1
 powershell -ExecutionPolicy Bypass -File scripts\uninstall_windows_task.ps1
 
 Get-ScheduledTask -TaskName NiftySpotSignalEngine*
+Get-Content data\live\market-session.log -Tail 30
 ```
 
 ## See also

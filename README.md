@@ -40,11 +40,12 @@ cp .env.example .env
 # Edit .env with UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 ```
 
-**Windows** — see [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md) for full install, Task Scheduler, and troubleshooting.
+**Windows** — see [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md) for production setup (hidden tasks, SSL fix, enhanced Telegram alerts).
 
 ```powershell
-python -m pip install -r requirements.txt
+py -m pip install -r requirements.txt
 copy .env.example .env
+# Run PowerShell as Administrator:
 powershell -ExecutionPolicy Bypass -File scripts\install_windows_task.ps1
 ```
 
