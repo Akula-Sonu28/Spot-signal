@@ -63,7 +63,10 @@ def test_session_process_control_messages(tmp_path: Path, monkeypatch):
         "running_pid",
         lambda: 4242,
     )
-    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(
+        "bot.telegram_commands.terminate_process",
+        lambda pid: None,
+    )
     assert proc.stop() == "Stop signal sent to pid 4242."
 
 

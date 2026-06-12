@@ -32,13 +32,25 @@ Upstox REST (index 5m + futures VWAP)
 
 ### Setup
 
+**macOS / Linux**
+
 ```bash
 python3 -m pip install -r requirements.txt
 cp .env.example .env
 # Edit .env with UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 ```
 
+**Windows** — see [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md) for full install, Task Scheduler, and troubleshooting.
+
+```powershell
+python -m pip install -r requirements.txt
+copy .env.example .env
+powershell -ExecutionPolicy Bypass -File scripts\install_windows_task.ps1
+```
+
 ### Run
+
+**macOS / Linux**
 
 ```bash
 # Single tick (testing)
@@ -46,6 +58,13 @@ python3 -m bot.main --once
 
 # Full session loop (09:15–15:30 IST)
 python3 -m bot.main
+```
+
+**Windows** — manual session or Telegram `/start` (remote listener must be running):
+
+```powershell
+python -m bot.main --once
+powershell -ExecutionPolicy Bypass -File scripts\run_market_session.ps1
 ```
 
 ### Safety
@@ -74,6 +93,9 @@ python3 -m bot.main
 | `bot/strategy.py` | Signal logic (Phase 0) |
 | `bot/indicators.py` | ATR/ADX/VWAP (Phase 0) |
 | `scripts/check_today.py` | One-shot historical validation |
+| `scripts/run_market_session.ps1` | Windows session wrapper |
+| `scripts/install_windows_task.ps1` | Windows Task Scheduler install |
+| `docs/WINDOWS_SETUP.md` | Full Windows setup guide |
 
 ### Pine / TradingView
 

@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
-import signal
 import subprocess
 import urllib.error
 import urllib.parse
@@ -17,6 +15,13 @@ from zoneinfo import ZoneInfo
 
 from bot.alerts import TelegramAlerter
 from bot.config import AppConfig
+from bot.platform_paths import (
+    default_market_session_script,
+    popen_session_kwargs,
+    process_exists,
+    session_start_command,
+    terminate_process,
+)
 from bot.scheduler import after_monitor_close, in_monitor_window, in_signal_window
 from bot.state import LiveMonitorState, PositionSide
 
@@ -24,7 +29,7 @@ FORCE_TICK_FLAG = Path("data/live/force_tick.request")
 DEFAULT_OFFSET_FILE = Path("data/live/telegram_offset.json")
 DEFAULT_LOCK_FILE = Path("data/live/market-session.lock")
 DEFAULT_SESSION_LOG = Path("data/live/market-session.log")
-DEFAULT_START_SCRIPT = Path("scripts/run_market_session.sh")
+DEFAULT_START_SCRIPT = default_market_session_script()
 
 KNOWN_COMMANDS = frozenset({"start", "stop", "status", "help", "tick"})
 
@@ -67,26 +72,28 @@ class SessionProcessControl:
         self,
         *,
         lock_file: Path = DEFAULT_LOCK_FILE,
-        start_script: Path = DEFAULT_START_SCRIPT,
+        start_script: Path | None = None,
         session_log: Path = DEFAULT_SESSION_LOG,
     ) -> None:
         self.lock_file = lock_file
-        self.start_script = start_script
+        self.start_script = start_script or default_market_session_script()
         self.session_log = session_log
         self.project_root = _project_root()
 
+    def _resolve_path(self, path: Path) -> Path:
+        return path if path.is_absolute() else self.project_root / path
+
     def running_pid(self) -> int | None:
-        if not self.lock_file.exists():
+        lock_path = self._resolve_path(self.lock_file)
+        if not lock_path.exists():
             return None
         try:
-            pid = int(self.lock_file.read_text(encoding="utf-8").strip())
+            pid = int(lock_path.read_text(encoding="utf-8").strip())
         except ValueError:
             return None
         if pid <= 0:
             return None
-        try:
-            os.kill(pid, 0)
-        except OSError:
+        if not process_exists(pid):
             return None
         return pid
 
@@ -105,11 +112,11 @@ class SessionProcessControl:
         if not script.exists():
             raise FileNotFoundError(f"Start script not found: {script}")
         subprocess.Popen(
-            [str(script)],
+            session_start_command(script),
             cwd=str(self.project_root),
-            start_new_session=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            **popen_session_kwargs(),  # type: ignore[arg-type]
         )
         return "Starting market session… You should get a startup Telegram within ~30s."
 
@@ -117,7 +124,7 @@ class SessionProcessControl:
         pid = self.running_pid()
         if pid is None:
             return "Not running."
-        os.kill(pid, signal.SIGTERM)
+        terminate_process(pid)
         return f"Stop signal sent to pid {pid}."
 
     def last_log_line(self) -> str | None:
