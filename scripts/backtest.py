@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backtest v3.7 strategy on Upstox historical data or local CSV."""
+"""Backtest v3.9 combined strategy on Upstox historical data or local CSV."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bot.backtest import format_report, run_backtest
-from bot.config import DEFAULT_CONFIG, load_app_config
+from bot.config import CombinedStrategyConfig, DEFAULT_CONFIG, load_app_config, load_combined_config
 from bot.historical_data import build_backtest_dataframe, trading_days_back
 from bot.replay import load_candles_csv, run_replay_fast
 
@@ -36,15 +36,36 @@ def _today_csv_fallback() -> Path | None:
     return path if path.exists() else None
 
 
-def _run_on_dataframe(df, session_dates: list[str] | None, title: str) -> int:
-    logger = run_replay_fast(df)
+def _combined_cfg(v38_only: bool) -> CombinedStrategyConfig:
+    base = load_combined_config(DEFAULT_CONFIG)
+    if v38_only:
+        return CombinedStrategyConfig(
+            strategy=base.strategy,
+            enable_j_plus=False,
+            j_trap=base.j_trap,
+        )
+    return base
+
+
+def _run_on_dataframe(
+    df,
+    session_dates: list[str] | None,
+    title: str,
+    combined_cfg: CombinedStrategyConfig,
+) -> int:
+    logger = run_replay_fast(df, combined_cfg=combined_cfg)
     summary = run_backtest(logger, session_dates=session_dates)
     print(format_report(summary, title=title))
     return 0 if summary.total_trades >= 0 else 1
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Backtest NIFTY v3.7 on available candle data")
+    parser = argparse.ArgumentParser(description="Backtest NIFTY v3.9 combined on available candle data")
+    parser.add_argument(
+        "--v38-only",
+        action="store_true",
+        help="Disable J+ (v3.8 valid-OR days only; wide OR days skip)",
+    )
     parser.add_argument("--days", type=int, default=15, help="Weekdays to backtest ending today")
     parser.add_argument("--from", dest="from_date", help="Start date YYYY-MM-DD")
     parser.add_argument("--to", dest="to_date", help="End date YYYY-MM-DD (default: today)")
@@ -53,12 +74,14 @@ def main() -> int:
     parser.add_argument("--no-cache", action="store_true", help="Refetch Upstox data, ignore cache")
     parser.add_argument("--out", type=Path, help="Write JSON summary to path")
     args = parser.parse_args()
+    combined = _combined_cfg(args.v38_only)
+    mode_label = "v3.8-only" if args.v38_only else "v3.9 combined"
 
     if args.mock:
         all_trades = []
         for path in sorted(MOCK_DIR.glob("*.csv")):
             df = load_candles_csv(path)
-            logger = run_replay_fast(df)
+            logger = run_replay_fast(df, combined_cfg=combined)
             sessions = sorted(df["session_date"].unique())
             summary = run_backtest(logger, session_dates=sessions)
             print(format_report(summary, title=f"Mock: {path.name}"))
@@ -69,7 +92,7 @@ def main() -> int:
     if args.csv:
         df = load_candles_csv(args.csv)
         sessions = sorted(df["session_date"].unique())
-        return _run_on_dataframe(df, sessions, title=f"CSV: {args.csv.name}")
+        return _run_on_dataframe(df, sessions, title=f"CSV: {args.csv.name} ({mode_label})", combined_cfg=combined)
 
     token = _load_env()
     if args.from_date:
@@ -119,8 +142,8 @@ def main() -> int:
     if skipped:
         print(f"Skipped (no data): {', '.join(skipped)}")
 
-    title = f"Backtest {loaded[0]} → {loaded[-1]} ({len(loaded)} sessions)"
-    logger = run_replay_fast(df)
+    title = f"Backtest {loaded[0]} → {loaded[-1]} ({len(loaded)} sessions, {mode_label})"
+    logger = run_replay_fast(df, combined_cfg=combined)
     summary = run_backtest(logger, session_dates=loaded)
     print(format_report(summary, title=title))
 

@@ -9,13 +9,15 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from bot.alerts import TelegramAlerter
+from bot.combined import process_session_bar
 from bot.config import AUTO_TRADE, AppConfig, StrategyConfig
+from bot.day_router import ensure_day_mode
 from bot.data_feed import DataFeedError, fetch_with_retry, is_bar_complete, is_data_stale
 from bot.indicators import or_width
 from bot.logger import LiveEventLogger, ReplayLogger, SignalEvent
 from bot.state import LiveMonitorState, Position, make_day_state
 from bot.signal_enrich import enrich_event, save_option_on_position, snapshot_option
-from bot.strategy import BarContext, build_bar_context, process_bar
+from bot.strategy import BarContext, build_bar_context
 
 DATA_WARNING_THROTTLE_MIN = 15
 SIGNALS_PAUSED_AFTER_MIN = 15
@@ -279,7 +281,11 @@ class LiveScheduler:
 
             option_snap = snapshot_option(replay.position)
             before = len(logger.events)
-            process_bar(replay, bar, logger, self.cfg.strategy)
+            combined = self.cfg.combined
+            if combined is None:
+                from bot.config import load_combined_config
+                combined = load_combined_config(self.cfg.strategy)
+            process_session_bar(replay, bar, logger, combined)
             after = len(logger.events)
             if after > before:
                 prepared = self._prepare_trade_events(
@@ -298,11 +304,19 @@ class LiveScheduler:
             if monitor.day and monitor.day.or_defined and not monitor.or_alert_sent:
                 width = or_width(monitor.day.or_high, monitor.day.or_low)
                 if width is not None:
-                    self.alerter.or_ready(monitor.day.or_high or 0, monitor.day.or_low or 0, width)
+                    mode = ensure_day_mode(monitor.day, self.cfg.strategy)
+                    mode_str = mode.value if mode is not None else "UNKNOWN"
+                    self.alerter.or_ready(
+                        monitor.day.or_high or 0,
+                        monitor.day.or_low or 0,
+                        width,
+                        day_mode=mode_str,
+                        enable_j_plus=combined.enable_j_plus,
+                    )
                     monitor.or_alert_sent = True
                     self.event_log.log_system(
                         "OR_READY",
-                        f"OR {monitor.day.or_high}/{monitor.day.or_low} width={width:.2f}",
+                        f"OR {monitor.day.or_high}/{monitor.day.or_low} width={width:.2f} mode={mode_str}",
                     )
 
         self._track_signals_paused(monitor, now, bars_processed)

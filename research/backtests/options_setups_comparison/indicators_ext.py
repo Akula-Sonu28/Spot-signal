@@ -57,6 +57,47 @@ def swing_low(lows: list[float], end_index: int, lookback: int = 5) -> float | N
     return min(lows[start : end_index + 1])
 
 
+def rsi_series(closes: list[float], period: int = 14) -> list[float | None]:
+    """Wilder RSI aligned with bot ADX smoothing style."""
+    n = len(closes)
+    out: list[float | None] = [None] * n
+    if n < period + 1:
+        return out
+    gains: list[float] = [0.0]
+    losses: list[float] = [0.0]
+    for i in range(1, n):
+        ch = closes[i] - closes[i - 1]
+        gains.append(max(ch, 0.0))
+        losses.append(max(-ch, 0.0))
+    from bot.indicators import wilder_rma
+
+    avg_gain = wilder_rma(gains, period)
+    avg_loss = wilder_rma(losses, period)
+    for i in range(n):
+        if avg_gain[i] is None or avg_loss[i] is None:
+            continue
+        if avg_loss[i] == 0:
+            out[i] = 100.0
+        else:
+            rs = avg_gain[i] / avg_loss[i]
+            out[i] = 100.0 - 100.0 / (1.0 + rs)
+    return out
+
+
+def volume_ratio(volumes: list[float], index: int, lookback: int = 20) -> float | None:
+    if index < lookback - 1:
+        return None
+    window = volumes[index - lookback + 1 : index + 1]
+    avg = sum(window) / len(window)
+    if avg <= 0:
+        return None
+    return volumes[index] / avg
+
+
+def bar_minutes_ist(bar_ts) -> int:
+    return bar_ts.hour * 60 + bar_ts.minute
+
+
 def vwap_slope(vwaps: list[float | None], end_index: int, lookback: int = 3) -> float | None:
     """Simple slope: current vwap minus vwap lookback bars ago."""
     if end_index < lookback:

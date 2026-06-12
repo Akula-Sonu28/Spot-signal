@@ -1,0 +1,424 @@
+//@version=6
+// =============================================================================
+// NIFTY SPOT SIGNAL ENGINE v3.8 LOCKED — ORB + VWAP + ADX
+// =============================================================================
+// LOCKED 2026-06-12 — see docs/LOCKED_STRATEGY_v3.8.md
+// Entries: 15-min OR, width 25–100, VWAP, ADX ≥ 18, max 2 trades/day
+// Exits (sweep winner, matches bot/strategy.py):
+//   - OR Range stop + 10pt buffer
+//   - Close-only SL (ignore wicks)
+//   - Decoupled target: ATR × 1.2 × RR 2.0
+//   - Both directions (market-agnostic)
+// =============================================================================
+
+strategy(
+     "NIFTY Spot Signal Engine v3.8 LOCKED",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 100000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 100,
+     commission_type = strategy.commission.cash_per_order,
+     commission_value = 40,
+     slippage = 2,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     max_bars_back = 500,
+     currency = currency.INR
+)
+
+//=============================================================================
+// INPUT GROUPS
+//=============================================================================
+const string grpORB     = "1. Opening Range"
+const string grpFilter  = "2. Breakout Filters"
+const string grpRisk    = "3. Stop & Target"
+const string grpSession = "4. Session Controls"
+const string grpOption  = "5. Options Execution"
+const string grpVisual  = "6. Visuals"
+
+//=============================================================================
+// 1. OPENING RANGE
+//=============================================================================
+int orMinutes        = input.int(15, "Opening Range Duration (minutes)", minval = 5, maxval = 60, step = 5, group = grpORB)
+float minOrRange     = input.float(25.0, "Minimum OR Range (points, skip if below)", minval = 0, step = 5, group = grpORB)
+float maxOrRange     = input.float(100.0, "Maximum OR Range (points, skip if above)", minval = 50, step = 10, group = grpORB)
+bool requireClose    = input.bool(true, "Require candle CLOSE beyond OR (not just wick)", group = grpORB)
+
+//=============================================================================
+// 2. BREAKOUT FILTERS
+//=============================================================================
+bool useVwapFilter   = input.bool(true, "VWAP alignment filter", group = grpFilter)
+bool useVolFilter    = input.bool(false, "Volume filter (breakout bar ≥ avg)", group = grpFilter)
+int volAvgLen        = input.int(20, "Volume average length", minval = 5, group = grpFilter)
+float volMultiplier  = input.float(1.0, "Volume multiplier threshold", minval = 0.5, step = 0.1, group = grpFilter)
+bool useAdxFilter    = input.bool(true, "ADX trend filter (skip chop days)", group = grpFilter)
+int adxFilterLen     = input.int(14, "ADX length", minval = 5, group = grpFilter)
+float adxMinThresh   = input.float(18.0, "Minimum ADX for trade", minval = 10, step = 1, group = grpFilter)
+bool skipTuesday     = input.bool(false, "Skip Tuesday (weakest ORB day)", group = grpFilter)
+
+//=============================================================================
+// 3. STOP & TARGET (simple: SL + Target + EOD only)
+//=============================================================================
+string slMode        = input.string("OR Range", "Stop-loss mode", options = ["ATR", "OR Range", "Tighter of ATR/OR"], group = grpRisk)
+bool closeOnlySl     = input.bool(true, "Close-only SL (ignore wicks)", group = grpRisk)
+float slBufferPts    = input.float(10.0, "SL buffer beyond OR (points)", minval = 0, step = 5, group = grpRisk)
+float atrSlMult      = input.float(1.4, "ATR stop multiplier", minval = 0.5, maxval = 5.0, step = 0.1, group = grpRisk)
+int atrLen           = input.int(14, "ATR length", minval = 5, group = grpRisk)
+float atrTargetMult  = input.float(1.2, "ATR target multiplier (decoupled)", minval = 0.5, maxval = 3.0, step = 0.1, group = grpRisk)
+float rrRatio        = input.float(2.0, "RR ratio (decoupled target)", minval = 0.5, maxval = 5.0, step = 0.1, group = grpRisk)
+
+//=============================================================================
+// 4. SESSION CONTROLS
+//=============================================================================
+string tzInput       = input.string("Asia/Kolkata", "Timezone", group = grpSession)
+int squareOffH       = input.int(15, "Square-off hour", minval = 13, maxval = 15, group = grpSession)
+int squareOffM       = input.int(15, "Square-off minute", minval = 0, maxval = 59, group = grpSession)
+int maxTradesDay     = input.int(2, "Max trades per day", minval = 1, maxval = 5, group = grpSession)
+float dailyMaxLoss   = input.float(0.0, "Daily max loss (currency, 0=off)", minval = 0, step = 50, group = grpSession)
+float dailyProfitLock = input.float(0.0, "Daily profit lock (currency, 0=off)", minval = 0, step = 50, group = grpSession)
+string tradeDirection = input.string("Both", "Trade direction", options = ["Both", "Long Only (CE)", "Short Only (PE)"], group = grpSession)
+
+//=============================================================================
+// 5. OPTIONS EXECUTION
+//=============================================================================
+string strikePref    = input.string("ATM or 1-step ITM", "Strike preference", options = ["ATM", "1-step ITM", "ATM or 1-step ITM"], group = grpOption)
+string expiryInstr   = input.string("Current weekly expiry; adjust for holidays.", "Expiry instruction", group = grpOption)
+string premiumInstr  = input.string("Use 40-50% premium SL for live options.", "Premium instruction", group = grpOption)
+
+//=============================================================================
+// 6. VISUALS
+//=============================================================================
+bool showOrLines     = input.bool(true, "Show Opening Range lines", group = grpVisual)
+bool showLevels      = input.bool(true, "Show active SL/Target", group = grpVisual)
+bool showDash        = input.bool(true, "Show dashboard", group = grpVisual)
+bool showMarkers     = input.bool(true, "Show entry/exit markers", group = grpVisual)
+
+//=============================================================================
+// HELPERS
+//=============================================================================
+f_safe(string txt) =>
+    str.replace_all(txt, "\"", "'")
+
+f_num(float x) =>
+    na(x) ? "null" : str.tostring(x, format.mintick)
+
+f_json(string sig, string dir, string optSide, float ep, float sl, float tp, string reason) =>
+    string r = "{\"signal\":\"" + f_safe(sig) + "\","
+    r += "\"direction\":\"" + f_safe(dir) + "\","
+    r += "\"underlying\":\"" + f_safe(syminfo.tickerid) + "\","
+    r += "\"option_side\":\"" + f_safe(optSide) + "\","
+    r += "\"strike\":\"" + f_safe(strikePref) + "\","
+    r += "\"expiry\":\"" + f_safe(expiryInstr) + "\","
+    r += "\"tf\":\"" + f_safe(timeframe.period) + "\","
+    r += "\"entry\":" + f_num(ep) + ","
+    r += "\"sl\":" + f_num(sl) + ","
+    r += "\"target\":" + f_num(tp) + ","
+    r += "\"premium_note\":\"" + f_safe(premiumInstr) + "\","
+    r += "\"rr\":" + str.tostring(rrRatio, "#.#") + ","
+    r += "\"ts\":\"" + str.format_time(time_close, "yyyy-MM-dd HH:mm:ss", tzInput) + "\","
+    r += "\"reason\":\"" + f_safe(reason) + "\"}"
+    r
+
+//=============================================================================
+// INDICATORS
+//=============================================================================
+float vwapVal    = ta.vwap(hlc3)
+float volAvg     = ta.sma(volume, volAvgLen)
+float atrVal     = ta.atr(atrLen)
+[diPlus, diMinus, adxVal] = ta.dmi(adxFilterLen, adxFilterLen)
+
+bool adxOk = not useAdxFilter or adxVal >= adxMinThresh
+
+//=============================================================================
+// TIME LOGIC
+//=============================================================================
+int barMin = hour(time_close, tzInput) * 60 + minute(time_close, tzInput)
+int marketOpen = 9 * 60 + 15
+int orEndMin = marketOpen + orMinutes
+int sqOffMin = squareOffH * 60 + squareOffM
+
+bool isInOR = barMin >= marketOpen and barMin < orEndMin
+bool isAfterOR = barMin >= orEndMin
+bool isSquareOff = barMin >= sqOffMin
+bool isEntryWindow = isAfterOR and not isSquareOff
+
+//=============================================================================
+// DAY-OF-WEEK FILTER
+//=============================================================================
+bool isTuesday = dayofweek == dayofweek.tuesday
+bool dayOk = not (skipTuesday and isTuesday)
+
+//=============================================================================
+// OPENING RANGE CAPTURE
+//=============================================================================
+var float orHigh = na
+var float orLow = na
+var bool orDefined = false
+
+bool isDayChange = ta.change(time("D")) != 0
+
+if isDayChange
+    orHigh := na
+    orLow := na
+    orDefined := false
+
+if isInOR
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow := na(orLow) ? low : math.min(orLow, low)
+
+if isAfterOR and not na(orHigh) and not na(orLow)
+    orDefined := true
+
+float orRange = orDefined ? orHigh - orLow : na
+bool orWidthOk = orDefined and not na(orRange) and orRange >= minOrRange and orRange <= maxOrRange
+
+//=============================================================================
+// DAILY STATE
+//=============================================================================
+var int tradesToday = 0
+var float dayStartEquity = strategy.equity
+var bool dailyLocked = false
+var string dailyLockReason = "NONE"
+var bool firedLongToday = false
+var bool firedShortToday = false
+
+if isDayChange
+    tradesToday := 0
+    dayStartEquity := strategy.equity
+    dailyLocked := false
+    dailyLockReason := "NONE"
+    firedLongToday := false
+    firedShortToday := false
+
+float dayPnl = strategy.equity - dayStartEquity
+
+if not dailyLocked
+    if dailyMaxLoss > 0 and dayPnl <= -dailyMaxLoss
+        dailyLocked := true
+        dailyLockReason := "DAILY_MAX_LOSS"
+    else if dailyProfitLock > 0 and dayPnl >= dailyProfitLock
+        dailyLocked := true
+        dailyLockReason := "DAILY_PROFIT_LOCK"
+
+//=============================================================================
+// TRADE STATE
+//=============================================================================
+var float activeEntry = na
+var float activeStop = na
+var float activeTarget = na
+var string activeSide = "NONE"
+var int lastEntryBar = na
+
+bool isFlat = strategy.position_size == 0
+bool justWentFlat = strategy.position_size == 0 and nz(strategy.position_size[1]) != 0
+
+if justWentFlat
+    activeEntry := na
+    activeStop := na
+    activeTarget := na
+    activeSide := "NONE"
+
+//=============================================================================
+// BREAKOUT DETECTION
+//=============================================================================
+bool longBreakRaw = orDefined and isAfterOR and close > orHigh
+bool shortBreakRaw = orDefined and isAfterOR and close < orLow
+
+bool vwapLongOk = not useVwapFilter or close > vwapVal
+bool vwapShortOk = not useVwapFilter or close < vwapVal
+bool volOk = not useVolFilter or nz(volume, 0) == 0 or volume >= volAvg * volMultiplier
+
+bool longBreak = barstate.isconfirmed and longBreakRaw and vwapLongOk and volOk and adxOk and orWidthOk and dayOk
+bool shortBreak = barstate.isconfirmed and shortBreakRaw and vwapShortOk and volOk and adxOk and orWidthOk and dayOk
+
+//=============================================================================
+// ENTRY PERMISSION
+//=============================================================================
+bool dirLongOk = tradeDirection != "Short Only (PE)"
+bool dirShortOk = tradeDirection != "Long Only (CE)"
+
+bool canTrade = isEntryWindow and not dailyLocked and tradesToday < maxTradesDay
+bool noDup = na(lastEntryBar) or bar_index > lastEntryBar
+
+bool buyCeSignal = longBreak and canTrade and noDup and not firedLongToday and dirLongOk and isFlat
+bool buyPeSignal = shortBreak and canTrade and noDup and not firedShortToday and dirShortOk and isFlat
+
+//=============================================================================
+// STOP / TARGET CALCULATION (at entry time)
+//=============================================================================
+float atrStop = atrVal * atrSlMult
+float longStopATR = close - atrStop
+float shortStopATR = close + atrStop
+float longStopOR = orLow - slBufferPts
+float shortStopOR = orHigh + slBufferPts
+
+float longStopCalc = switch slMode
+    "ATR" => longStopATR
+    "OR Range" => longStopOR
+    => math.max(longStopATR, longStopOR)
+
+float shortStopCalc = switch slMode
+    "ATR" => shortStopATR
+    "OR Range" => shortStopOR
+    => math.min(shortStopATR, shortStopOR)
+
+float longRisk = close - longStopCalc
+float shortRisk = shortStopCalc - close
+float longTargetCalc = close + atrVal * atrTargetMult * rrRatio
+float shortTargetCalc = close - atrVal * atrTargetMult * rrRatio
+
+//=============================================================================
+// STRATEGY EXIT ORDERS — wick SL or close-only SL + target
+//=============================================================================
+if not closeOnlySl and strategy.position_size > 0 and not na(activeStop) and not na(activeTarget)
+    strategy.exit("CE_EXIT", from_entry = "BUY_CE", stop = activeStop, limit = activeTarget, comment_profit = "TARGET CE", comment_loss = "SL CE", disable_alert = true)
+
+if not closeOnlySl and strategy.position_size < 0 and not na(activeStop) and not na(activeTarget)
+    strategy.exit("PE_EXIT", from_entry = "BUY_PE", stop = activeStop, limit = activeTarget, comment_profit = "TARGET PE", comment_loss = "SL PE", disable_alert = true)
+
+if closeOnlySl and strategy.position_size > 0 and not na(activeTarget)
+    strategy.exit("CE_TGT", from_entry = "BUY_CE", limit = activeTarget, comment_profit = "TARGET CE", disable_alert = true)
+
+if closeOnlySl and strategy.position_size < 0 and not na(activeTarget)
+    strategy.exit("PE_TGT", from_entry = "BUY_PE", limit = activeTarget, comment_profit = "TARGET PE", disable_alert = true)
+
+if closeOnlySl and barstate.isconfirmed and strategy.position_size > 0 and not na(activeStop) and close <= activeStop
+    strategy.close("BUY_CE", comment = "SL CE close")
+
+if closeOnlySl and barstate.isconfirmed and strategy.position_size < 0 and not na(activeStop) and close >= activeStop
+    strategy.close("BUY_PE", comment = "SL PE close")
+
+//=============================================================================
+// SQUARE-OFF
+//=============================================================================
+if barstate.isconfirmed and isSquareOff and strategy.position_size != 0
+    string side = strategy.position_size > 0 ? "CE" : "PE"
+    string dir = strategy.position_size > 0 ? "LONG_EXIT" : "SHORT_EXIT"
+    string sqJson = f_json("SQUARE_OFF", dir, side, activeEntry, activeStop, activeTarget, "EOD_SQUARE_OFF")
+    strategy.close_all(comment = "SQUARE OFF", alert_message = sqJson, disable_alert = true)
+    alert(sqJson, alert.freq_once_per_bar_close)
+
+//=============================================================================
+// ENTRIES
+//=============================================================================
+if buyCeSignal and longRisk > 0
+    activeEntry := close
+    activeStop := longStopCalc
+    activeTarget := longTargetCalc
+    activeSide := "CE"
+
+    string buyJson = f_json("BUY_CE", "LONG", "CE", activeEntry, activeStop, activeTarget, "ORB_BREAKOUT+VWAP+ADX+VOL")
+    strategy.entry("BUY_CE", strategy.long, comment = "BUY CE", alert_message = buyJson, disable_alert = true)
+    alert(buyJson, alert.freq_once_per_bar_close)
+
+    tradesToday += 1
+    firedLongToday := true
+    lastEntryBar := bar_index
+
+if buyPeSignal and shortRisk > 0
+    activeEntry := close
+    activeStop := shortStopCalc
+    activeTarget := shortTargetCalc
+    activeSide := "PE"
+
+    string buyJson = f_json("BUY_PE", "SHORT", "PE", activeEntry, activeStop, activeTarget, "ORB_BREAKDOWN+VWAP+ADX+VOL")
+    strategy.entry("BUY_PE", strategy.short, comment = "BUY PE", alert_message = buyJson, disable_alert = true)
+    alert(buyJson, alert.freq_once_per_bar_close)
+
+    tradesToday += 1
+    firedShortToday := true
+    lastEntryBar := bar_index
+
+//=============================================================================
+// BAR-CLOSE STOP/TARGET ALERTS
+//=============================================================================
+bool ceWasOpen = nz(strategy.position_size[1]) > 0
+bool peWasOpen = nz(strategy.position_size[1]) < 0
+float prevStop = activeStop[1]
+float prevTarget = activeTarget[1]
+float prevEntry = activeEntry[1]
+
+bool ceSlHit = barstate.isconfirmed and ceWasOpen and not na(prevStop) and (closeOnlySl ? close <= prevStop : low <= prevStop)
+bool ceTgtHit = barstate.isconfirmed and ceWasOpen and not ceSlHit and not na(prevTarget) and high >= prevTarget
+bool peSlHit = barstate.isconfirmed and peWasOpen and not na(prevStop) and (closeOnlySl ? close >= prevStop : high >= prevStop)
+bool peTgtHit = barstate.isconfirmed and peWasOpen and not peSlHit and not na(prevTarget) and low <= prevTarget
+
+if ceSlHit
+    alert(f_json("SL_CE", "LONG_EXIT", "CE", prevEntry, prevStop, prevTarget, "STOP_HIT"), alert.freq_once_per_bar_close)
+if ceTgtHit
+    alert(f_json("TGT_CE", "LONG_EXIT", "CE", prevEntry, prevStop, prevTarget, "TARGET_HIT"), alert.freq_once_per_bar_close)
+if peSlHit
+    alert(f_json("SL_PE", "SHORT_EXIT", "PE", prevEntry, prevStop, prevTarget, "STOP_HIT"), alert.freq_once_per_bar_close)
+if peTgtHit
+    alert(f_json("TGT_PE", "SHORT_EXIT", "PE", prevEntry, prevStop, prevTarget, "TARGET_HIT"), alert.freq_once_per_bar_close)
+
+//=============================================================================
+// PLOTS
+//=============================================================================
+float orHighPlot = orDefined ? orHigh : na
+float orLowPlot = orDefined ? orLow : na
+
+plot(showOrLines ? orHighPlot : na, "OR High", color = color.new(color.green, 20), linewidth = 2, style = plot.style_linebr)
+plot(showOrLines ? orLowPlot : na, "OR Low", color = color.new(color.red, 20), linewidth = 2, style = plot.style_linebr)
+plot(vwapVal, "VWAP", color = color.new(color.blue, 30), linewidth = 1)
+
+plot(showLevels and strategy.position_size != 0 ? activeStop : na, "Active SL", color = color.red, style = plot.style_linebr, linewidth = 2)
+plot(showLevels and strategy.position_size != 0 ? activeTarget : na, "Active Target", color = color.green, style = plot.style_linebr, linewidth = 2)
+
+bgcolor(isInOR ? color.new(color.yellow, 92) : na, title = "OR Window")
+
+plotshape(showMarkers and buyCeSignal, title = "BUY CE", text = "CE", style = shape.labelup, location = location.belowbar, color = color.green, textcolor = color.white, size = size.small)
+plotshape(showMarkers and buyPeSignal, title = "BUY PE", text = "PE", style = shape.labeldown, location = location.abovebar, color = color.red, textcolor = color.white, size = size.small)
+
+plotshape(showMarkers and ceSlHit, title = "SL CE", text = "SL", style = shape.xcross, location = location.belowbar, color = color.red, size = size.tiny)
+plotshape(showMarkers and ceTgtHit, title = "TG CE", text = "TG", style = shape.diamond, location = location.abovebar, color = color.green, size = size.tiny)
+plotshape(showMarkers and peSlHit, title = "SL PE", text = "SL", style = shape.xcross, location = location.abovebar, color = color.red, size = size.tiny)
+plotshape(showMarkers and peTgtHit, title = "TG PE", text = "TG", style = shape.diamond, location = location.belowbar, color = color.green, size = size.tiny)
+
+//=============================================================================
+// DASHBOARD
+//=============================================================================
+var table dash = table.new(position.top_right, 2, 11, border_width = 1)
+
+f_row(int row, string lbl, string val, color bg) =>
+    table.cell(dash, 0, row, lbl, bgcolor = color.new(color.black, 5), text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, row, val, bgcolor = bg, text_color = color.white, text_size = size.small)
+
+if barstate.islast and showDash
+    string orStatus = not orDefined ? "Forming..." : orWidthOk ? str.tostring(orRange, "#") + " pts (OK)" : "Filtered"
+    color orBg = not orDefined ? color.new(color.yellow, 20) : orWidthOk ? color.new(color.green, 0) : color.new(color.red, 0)
+
+    string posTxt = strategy.position_size > 0 ? "LONG / CE" : strategy.position_size < 0 ? "SHORT / PE" : "Flat"
+    color posBg = strategy.position_size > 0 ? color.new(color.green, 0) : strategy.position_size < 0 ? color.new(color.red, 0) : color.new(color.gray, 30)
+
+    string sessTxt = isInOR ? "OR forming" : isEntryWindow ? "Live" : isSquareOff ? "Square-off" : "Closed"
+    color sessBg = isEntryWindow ? color.new(color.green, 0) : isInOR ? color.new(color.yellow, 20) : color.new(color.orange, 0)
+
+    string vwapTxt = close > vwapVal ? "Above (CE bias)" : "Below (PE bias)"
+    color vwapBg = close > vwapVal ? color.new(color.green, 0) : color.new(color.red, 0)
+
+    string adxTxt = str.tostring(adxVal, "#.#") + (adxOk ? " (trending)" : " (chop)")
+    color adxBg = adxOk ? color.new(color.green, 0) : color.new(color.orange, 0)
+
+    string dayTxt = isTuesday and skipTuesday ? "SKIP (Tuesday)" : dayofweek == dayofweek.thursday ? "Thursday" : dayofweek == dayofweek.friday ? "Friday" : "Normal"
+    color dayBg = isTuesday and skipTuesday ? color.new(color.red, 0) : (dayofweek == dayofweek.thursday or dayofweek == dayofweek.friday) ? color.new(color.green, 0) : color.new(color.gray, 30)
+
+    f_row(0, "OR Range", orStatus, orBg)
+    f_row(1, "Position", posTxt, posBg)
+    f_row(2, "Session", sessTxt, sessBg)
+    f_row(3, "VWAP", vwapTxt, vwapBg)
+    f_row(4, "ADX", adxTxt, adxBg)
+    f_row(5, "Day Filter", dayTxt, dayBg)
+    f_row(6, "Trades today", str.tostring(tradesToday) + "/" + str.tostring(maxTradesDay), tradesToday < maxTradesDay ? color.new(color.green, 0) : color.new(color.red, 0))
+    f_row(7, "RR Ratio", "1:" + str.tostring(rrRatio, "#.#"), color.new(color.blue, 20))
+    f_row(8, "SL Mode", slMode, color.new(color.gray, 30))
+    f_row(9, "Day P&L", dailyLocked ? dailyLockReason : str.tostring(dayPnl, "#.##"), dailyLocked ? color.new(color.red, 0) : color.new(color.gray, 30))
+    f_row(10, "Direction", tradeDirection, color.new(color.gray, 30))
+
+//=============================================================================
+// ALERT CONDITIONS
+//=============================================================================
+alertcondition(buyCeSignal, title = "BUY CE", message = "NIFTY ORB: Breakout above — BUY CE confirmed")
+alertcondition(buyPeSignal, title = "BUY PE", message = "NIFTY ORB: Breakdown below — BUY PE confirmed")
+alertcondition(isSquareOff and strategy.position_size != 0, title = "Square Off", message = "NIFTY: Square off all positions")

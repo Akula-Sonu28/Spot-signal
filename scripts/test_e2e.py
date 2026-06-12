@@ -20,7 +20,9 @@ from bot.indicators import or_width
 from bot.logger import LiveEventLogger, ReplayLogger
 from bot.state import LiveMonitorState, make_day_state
 from bot.signal_enrich import enrich_event, save_option_on_position, snapshot_option
-from bot.strategy import build_bar_context, process_bar
+from bot.combined import process_session_bar
+from bot.day_router import ensure_day_mode
+from bot.strategy import build_bar_context
 
 
 def main() -> int:
@@ -81,7 +83,11 @@ def main() -> int:
         )
         option_snap = snapshot_option(replay.position)
         before = len(logger.events)
-        process_bar(replay, bar, logger, cfg.strategy)
+        combined = cfg.combined
+        if combined is None:
+            from bot.config import load_combined_config
+            combined = load_combined_config(cfg.strategy)
+        process_session_bar(replay, bar, logger, combined)
         after = len(logger.events)
         monitor.sync_from_replay(replay)
         monitor.last_processed_candle = bar.timestamp.isoformat()
@@ -89,7 +95,15 @@ def main() -> int:
         if replay.day and replay.day.or_defined and not monitor.or_alert_sent:
             w = or_width(replay.day.or_high, replay.day.or_low)
             if w is not None:
-                alerter.or_ready(replay.day.or_high or 0, replay.day.or_low or 0, w)
+                mode = ensure_day_mode(replay.day, cfg.strategy)
+                mode_str = mode.value if mode is not None else "V38"
+                alerter.or_ready(
+                    replay.day.or_high or 0,
+                    replay.day.or_low or 0,
+                    w,
+                    day_mode=mode_str,
+                    enable_j_plus=combined.enable_j_plus,
+                )
                 event_log.log_system("OR_READY", f"OR {replay.day.or_high}/{replay.day.or_low}")
                 monitor.or_alert_sent = True
                 print(f"  OR ready: {replay.day.or_high:.2f} / {replay.day.or_low:.2f}")

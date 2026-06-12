@@ -7,7 +7,7 @@ import signal
 import sys
 
 from bot.alerts import TelegramAlerter
-from bot.config import AUTO_TRADE, load_app_config, validate_app_config
+from bot.config import AUTO_TRADE, LOCKED_STRATEGY_VERSION, load_app_config, validate_app_config
 from bot.logger import LiveEventLogger
 from bot.scheduler import LiveScheduler
 
@@ -47,7 +47,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.once:
         try:
             alerter.bot_started()
-            event_log.log_system("BOT_STARTED", "Live monitor started (AUTO_TRADE=False)")
+            event_log.log_system(
+                "BOT_STARTED",
+                f"Live monitor started strategy=v{LOCKED_STRATEGY_VERSION} (AUTO_TRADE=False)",
+            )
         except Exception as exc:
             print(f"Failed to send startup Telegram: {exc}", file=sys.stderr)
             return 1
@@ -64,7 +67,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         alerter.bot_started()
-        event_log.log_system("BOT_STARTED", "Live monitor started (AUTO_TRADE=False)")
+        event_log.log_system(
+            "BOT_STARTED",
+            f"Live monitor started strategy=v{LOCKED_STRATEGY_VERSION} (AUTO_TRADE=False)",
+        )
     except Exception as exc:
         print(f"Failed to send startup Telegram: {exc}", file=sys.stderr)
         return 1

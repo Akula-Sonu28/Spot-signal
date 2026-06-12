@@ -115,15 +115,47 @@ def test_handler_status_and_tick(tmp_path: Path, monkeypatch):
     process = SessionProcessControl(lock_file=lock, session_log=tmp_path / "log.txt")
     process.project_root = tmp_path
 
-    handler = TelegramCommandHandler(cfg, FakeAlerter(), process=process)  # type: ignore[arg-type]
     monkeypatch.setattr(
         "bot.telegram_commands._project_root",
         lambda: tmp_path,
     )
+
+    from datetime import date
+
+    from bot.config import CombinedStrategyConfig
+    from bot.strategy_j import J_TRAP_ROBUST
+    from bot.state import LiveMonitorState, make_day_state
+
+    session = date.today().isoformat()
+    j_cfg = AppConfig(
+        upstox_access_token=cfg.upstox_access_token,
+        telegram_bot_token=cfg.telegram_bot_token,
+        telegram_chat_id=cfg.telegram_chat_id,
+        state_file=cfg.state_file,
+        combined=CombinedStrategyConfig(
+            strategy=cfg.strategy,
+            enable_j_plus=True,
+            j_trap=J_TRAP_ROBUST,
+        ),
+    )
+    alerter = FakeAlerter()
+    handler = TelegramCommandHandler(j_cfg, alerter, process=process)  # type: ignore[arg-type]
     handler.force_tick_flag = Path("force_tick.request")
+
+    day = make_day_state(session)
+    day.or_defined = True
+    day.or_high = 150.0
+    day.or_low = 40.0
+    day.day_mode = "J_PLUS"
+    day.trades_today = 0
+    monitor = LiveMonitorState(session_date=session, day=day)
+    monitor.save(tmp_path / "monitor_state.json")
 
     handler._dispatch(ParsedCommand("status", ()))
     assert sent and "nifty signal engine" in sent[0].lower()
+    assert "Mode:" in sent[0]
+    assert "J_PLUS" in sent[0]
+    assert "0/1 today" in sent[0]
 
     sent.clear()
     handler._dispatch(ParsedCommand("tick", ()))

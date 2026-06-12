@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Diagnose why few trades fire — entry filter funnel on historical CSVs."""
+"""Diagnose v3.8 entry filter funnel on V38 days; combined router for trade counts."""
 
 from __future__ import annotations
 
@@ -16,12 +16,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 
-from bot.config import StrategyConfig
+from bot.combined import process_session_bar
+from bot.config import StrategyConfig, load_combined_config
+from bot.day_router import DayMode, ensure_day_mode
 from bot.historical_data import trading_days_back
 from bot.indicators import or_width
 from bot.replay import load_candles_csv, run_replay_fast, _compute_indicators
 from bot.state import DayState, Position, PositionSide, ReplayState, make_day_state, reset_position
-from bot.strategy import build_bar_context, process_bar, _calc_stops, _calc_target
+from bot.logger import ReplayLogger
+from bot.strategy import build_bar_context, _calc_stops, _calc_target
 
 ROOT = Path(__file__).resolve().parent.parent
 HIST = ROOT / "data" / "historical"
@@ -58,6 +61,9 @@ def _analyze_session(
 
     counts = Counter()
     session_date = day.session_date
+    combined = load_combined_config(cfg)
+    logger = ReplayLogger()
+    session_day_mode: str | None = None
 
     # Per-day flags for funnel
     had_or = False
@@ -97,20 +103,26 @@ def _analyze_session(
             final_or_width = width
         or_width_ok = width is not None and cfg.min_or_range <= width <= cfg.max_or_range
 
+        mode = ensure_day_mode(day, cfg)
+        if mode is not None:
+            session_day_mode = mode.value
+
         if not bar.is_entry_window or not day.or_defined:
+            process_session_bar(state, bar, logger, combined)
             continue
 
-        long_break = bar.close > (day.or_high or float("inf"))
-        short_break = bar.close < (day.or_low or float("-inf"))
+        if mode == DayMode.V38:
+            long_break = bar.close > (day.or_high or float("inf"))
+            short_break = bar.close < (day.or_low or float("-inf"))
 
-        if long_break:
-            raw_long_bars += 1
-            _tally_long_filter(counts, bar, day, cfg, or_width_ok, position)
-        if short_break:
-            raw_short_bars += 1
-            _tally_short_filter(counts, bar, day, cfg, or_width_ok, position)
+            if long_break:
+                raw_long_bars += 1
+                _tally_long_filter(counts, bar, day, cfg, or_width_ok, position)
+            if short_break:
+                raw_short_bars += 1
+                _tally_short_filter(counts, bar, day, cfg, or_width_ok, position)
 
-        process_bar(state, bar, __import__("bot.logger", fromlist=["ReplayLogger"]).ReplayLogger(), cfg)
+        process_session_bar(state, bar, logger, combined)
 
     fw = final_or_width
     or_ok = fw is not None and cfg.min_or_range <= fw <= cfg.max_or_range
@@ -122,6 +134,7 @@ def _analyze_session(
         "raw_long_bars": raw_long_bars,
         "raw_short_bars": raw_short_bars,
         "trades": day.trades_today,
+        "day_mode": session_day_mode,
         "filter_counts": dict(counts),
     }
 
@@ -240,9 +253,11 @@ def run_funnel(df: pd.DataFrame, sessions: list[str], cfg: StrategyConfig) -> di
         1 for r in per_session if r["raw_long_bars"] == 0 and r["raw_short_bars"] == 0 and r["had_or"]
     )
     days_or_width_fail = sum(1 for r in per_session if r["had_or"] and not r["or_width_ok"])
+    mode_counts = Counter(r.get("day_mode") or "UNKNOWN" for r in per_session)
 
     return {
         "sessions": len(per_session),
+        "day_mode_counts": dict(mode_counts),
         "days_with_trades": days_with_trade,
         "days_no_breakout": days_no_or_break,
         "days_or_width_fail_all_day": days_or_width_fail,
@@ -254,7 +269,10 @@ def run_funnel(df: pd.DataFrame, sessions: list[str], cfg: StrategyConfig) -> di
 
 def _print_report(report: dict, cfg: StrategyConfig) -> None:
     n = report["sessions"]
-    print(f"Entry funnel — {n} sessions")
+    print(f"Entry funnel — {n} sessions (v3.8 tallies on V38 days only; trades via v3.9 router)")
+    modes = report.get("day_mode_counts", {})
+    if modes:
+        print(f"  Day modes: {', '.join(f'{k}={v}' for k, v in sorted(modes.items()))}")
     print(f"  Days with ≥1 trade:     {report['days_with_trades']} ({100*report['days_with_trades']/n:.0f}%)")
     print(f"  Days with 0 OR break:   {report['days_no_breakout']} ({100*report['days_no_breakout']/n:.0f}%)")
     print(f"  Days OR width invalid:  {report['days_or_width_fail_all_day']} (whole day)")

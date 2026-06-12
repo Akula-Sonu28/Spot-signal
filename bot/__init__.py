@@ -1,1 +1,1 @@
-"""Phase 0 mock/replay engine for NIFTY Spot Signal Engine v3.7."""
+"""NIFTY Spot Signal Engine — v3.9 combined replay and live monitoring."""

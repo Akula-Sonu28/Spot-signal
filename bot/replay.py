@@ -8,11 +8,12 @@ from pathlib import Path
 import pandas as pd
 from zoneinfo import ZoneInfo
 
-from bot.config import DEFAULT_CONFIG, StrategyConfig
+from bot.combined import process_session_bar
+from bot.config import CombinedStrategyConfig, DEFAULT_CONFIG, StrategyConfig, load_combined_config
 from bot.indicators import adx_series, atr_series, session_vwap_series
 from bot.logger import ReplayLogger
 from bot.state import ReplayState, make_day_state
-from bot.strategy import build_bar_context, process_bar
+from bot.strategy import build_bar_context
 
 
 def load_candles_csv(path: str | Path, tz: str = "Asia/Kolkata") -> pd.DataFrame:
@@ -61,8 +62,10 @@ def run_replay(
     df: pd.DataFrame,
     cfg: StrategyConfig = DEFAULT_CONFIG,
     logger: ReplayLogger | None = None,
+    combined_cfg: CombinedStrategyConfig | None = None,
 ) -> ReplayLogger:
     """Replay candles bar-by-bar; indicators use only data up to each bar."""
+    combined = combined_cfg or load_combined_config(cfg)
     logger = logger or ReplayLogger()
     state = ReplayState()
     zone = ZoneInfo(cfg.timezone)
@@ -102,7 +105,7 @@ def run_replay(
             cfg=cfg,
             tz=zone,
         )
-        process_bar(state, bar, logger, cfg)
+        process_session_bar(state, bar, logger, combined)
 
     return logger
 
@@ -111,9 +114,11 @@ def run_replay_fast(
     df: pd.DataFrame,
     cfg: StrategyConfig = DEFAULT_CONFIG,
     logger: ReplayLogger | None = None,
+    combined_cfg: CombinedStrategyConfig | None = None,
 ) -> ReplayLogger:
     """Faster replay using precomputed indicator columns on full dataframe."""
     enriched = _compute_indicators(df, cfg)
+    combined = combined_cfg or load_combined_config(cfg)
     logger = logger or ReplayLogger()
     state = ReplayState()
     zone = ZoneInfo(cfg.timezone)
@@ -143,13 +148,13 @@ def run_replay_fast(
             cfg=cfg,
             tz=zone,
         )
-        process_bar(state, bar, logger, cfg)
+        process_session_bar(state, bar, logger, combined)
 
     return logger
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Replay NIFTY 5m candles through v3.7 strategy")
+    parser = argparse.ArgumentParser(description="Replay NIFTY 5m candles through v3.9 combined strategy")
     parser.add_argument("csv", type=Path, help="Path to candle CSV")
     parser.add_argument(
         "--out",

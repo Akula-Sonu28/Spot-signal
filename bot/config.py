@@ -5,9 +5,16 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from bot.strategy_j import JTrapConfig
 
 # Hard safety default — no broker execution in this phase.
 AUTO_TRADE: bool = False
+
+# Frozen production strategy version (see docs/LOCKED_STRATEGY_v3.9.md)
+LOCKED_STRATEGY_VERSION: str = "3.9"
 
 
 @dataclass(frozen=True)
@@ -48,6 +55,15 @@ class StrategyConfig:
 
 
 @dataclass(frozen=True)
+class CombinedStrategyConfig:
+    """v3.9 combined router: v3.8 on valid OR days, J+ on wide OR days."""
+
+    strategy: StrategyConfig
+    enable_j_plus: bool
+    j_trap: JTrapConfig
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """Live monitoring application settings (from environment)."""
 
@@ -57,6 +73,7 @@ class AppConfig:
     auto_trade: bool = False
 
     strategy: StrategyConfig = StrategyConfig()
+    combined: CombinedStrategyConfig | None = None
 
     state_file: Path = Path("data/live/monitor_state.json")
     event_log_csv: Path = Path("data/live/signals.csv")
@@ -85,6 +102,33 @@ def _env_bool(name: str, default: bool) -> bool:
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     return int(raw) if raw else default
+
+
+def _load_j_trap_config():
+    from bot.strategy_j import JTrapConfig, J_TRAP_ROBUST
+
+    return JTrapConfig(
+        min_trap_excess_pts=float(os.getenv("J_MIN_TRAP_EXCESS", J_TRAP_ROBUST.min_trap_excess_pts)),
+        min_reclaim_pts=float(os.getenv("J_MIN_RECLAIM_PTS", J_TRAP_ROBUST.min_reclaim_pts)),
+        min_vwap_dist_pts=float(os.getenv("J_MIN_VWAP_DIST", J_TRAP_ROBUST.min_vwap_dist_pts)),
+        min_body_ratio=float(os.getenv("J_MIN_BODY_RATIO", J_TRAP_ROBUST.min_body_ratio)),
+        min_adx=float(os.getenv("J_ADX_MIN", J_TRAP_ROBUST.min_adx or 20.0)),
+        skip_both_trapped=_env_bool("J_SKIP_BOTH_TRAPPED", J_TRAP_ROBUST.skip_both_trapped),
+        min_minutes_after_or=_env_int("J_MINS_AFTER_OR", J_TRAP_ROBUST.min_minutes_after_or),
+        max_trades_day=_env_int("J_MAX_TRADES_DAY", J_TRAP_ROBUST.max_trades_day),
+        max_losses_day=_env_int("J_MAX_LOSSES_DAY", J_TRAP_ROBUST.max_losses_day),
+        one_trap_side_only=_env_bool("J_ONE_TRAP_SIDE_ONLY", J_TRAP_ROBUST.one_trap_side_only),
+    )
+
+
+def load_combined_config(strategy: StrategyConfig | None = None) -> CombinedStrategyConfig:
+    """Build combined v3.9 config from env (used by replay and live)."""
+    strat = strategy or DEFAULT_CONFIG
+    return CombinedStrategyConfig(
+        strategy=strat,
+        enable_j_plus=_env_bool("ENABLE_J_PLUS", True),
+        j_trap=_load_j_trap_config(),
+    )
 
 
 def load_app_config(env_file: str | Path | None = ".env") -> AppConfig:
@@ -129,12 +173,15 @@ def load_app_config(env_file: str | Path | None = ".env") -> AppConfig:
         timezone=os.getenv("TIMEZONE", DEFAULT_CONFIG.timezone),
     )
 
+    combined = load_combined_config(strategy)
+
     return AppConfig(
         upstox_access_token=token,
         telegram_bot_token=tg_token,
         telegram_chat_id=tg_chat,
         auto_trade=False,
         strategy=strategy,
+        combined=combined,
         state_file=Path(os.getenv("STATE_FILE", "data/live/monitor_state.json")),
         event_log_csv=Path(os.getenv("EVENT_LOG_CSV", "data/live/signals.csv")),
         poll_interval_sec=_env_int("POLL_INTERVAL_SEC", 20),

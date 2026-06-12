@@ -1,5 +1,21 @@
 # NIFTY Spot Signal Engine — Trading Guide
 
+## Day modes (v3.9)
+
+After the 15-minute opening range completes, the bot locks **one playbook** for the session:
+
+| OR width | Mode | What to expect |
+|----------|------|----------------|
+| `< 25 pts` | SKIP | No trades — OR too narrow |
+| `25–100 pts` | v3.8 | OR breakout CE/PE (max 2 trades) |
+| `> 100 pts` | J+ | Trap-fade only (max 1 trade after ~10:00) |
+
+The OR_READY Telegram message states the mode. Wide-OR days do **not** run v3.8 breakouts.
+
+Production reference: `docs/LOCKED_STRATEGY_v3.9.md`, `pine/nifty_spot_signal_engine_LOCKED_v3.9.pine`.
+
+---
+
 Sections F through M for the Pine Script v6 strategy in `pine/nifty_spot_signal_engine.pine`.
 
 ---

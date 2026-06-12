@@ -39,7 +39,7 @@ def _urlopen(req: urllib.request.Request, timeout: int = 20):  # type: ignore[re
         return urllib.request.urlopen(req, timeout=timeout, context=ctx)
 
 
-from bot.config import AppConfig
+from bot.config import LOCKED_STRATEGY_VERSION, AppConfig
 from bot.logger import SignalEvent
 from bot.option_lookup import OptionQuote, format_option_lines, format_premium_risk_lines
 from bot.state import Position
@@ -132,13 +132,13 @@ class TelegramAlerter:
 
     def bot_started(self) -> None:
         self.send(
-            "🟢 NIFTY Signal Engine  •  LIVE\n"
+            f"🟢 NIFTY Signal Engine  •  LIVE  (v{LOCKED_STRATEGY_VERSION})\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "Mode:       ALERTS ONLY  (no auto-trade)\n"
             "Instrument: NIFTY 50  |  5m bars  |  IST\n"
             "Session:    09:15 – 15:30\n"
             "Signals:    09:30 – 15:15  (post-OR)\n"
-            "Max trades: 2 per day  (1 CE + 1 PE)\n"
+            "Playbook:   set after OR  (v3.8 / J+ / skip)\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "Waiting for Opening Range…"
         )
@@ -150,24 +150,47 @@ class TelegramAlerter:
             f"Reason: {reason}"
         )
 
-    def or_ready(self, or_high: float, or_low: float, width: float) -> None:
-        # classify OR quality
-        if width < 30:
-            quality = "⚠️ Narrow — signals may be filtered"
-        elif width > 80:
-            quality = "⚠️ Wide — larger SL, higher risk"
+    def or_ready(
+        self,
+        or_high: float,
+        or_low: float,
+        width: float,
+        *,
+        day_mode: str = "V38",
+        enable_j_plus: bool = True,
+    ) -> None:
+        if day_mode == "SKIP":
+            mode_line = "Mode: SKIP — OR too narrow, no trades today"
+            action = "No entries for this session."
+        elif day_mode == "J_PLUS" and not enable_j_plus:
+            mode_line = "Mode: Wide OR — J+ disabled"
+            action = (
+                "OR width > 100 pts but ENABLE_J_PLUS=false.\n"
+                "No entries for this session."
+            )
+        elif day_mode == "J_PLUS":
+            mode_line = "Mode: J+ trap-fade (wide OR)"
+            action = (
+                "Fake-break trap fade only. Max 1 trade after ~10:00 IST.\n"
+                "v3.8 breakout module is OFF today."
+            )
         else:
-            quality = "✅ Good range"
+            mode_line = "Mode: v3.8 OR breakout"
+            action = (
+                f"📈 Breakout:  above {or_high:.2f}  →  BUY CE\n"
+                f"📉 Breakdown: below {or_low:.2f}  →  BUY PE\n"
+                "J+ trap module is OFF today."
+            )
 
         self.send(
             "📊 Opening Range Set\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"OR High:  {or_high:.2f}\n"
             f"OR Low:   {or_low:.2f}\n"
-            f"Width:    {width:.0f} pts  {quality}\n"
+            f"Width:    {width:.0f} pts\n"
+            f"{mode_line}\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📈 Breakout trigger:  above {or_high:.2f}  →  BUY CE\n"
-            f"📉 Breakdown trigger: below {or_low:.2f}  →  BUY PE\n"
+            f"{action}\n"
             "Signal window: 09:30 – 15:15 IST"
         )
 
@@ -282,12 +305,15 @@ class TelegramAlerter:
 
         lines = []
 
+        is_j_plus = extra.get("strategy") == "j_plus"
+        module_tag = "J+ trap-fade  •  " if is_j_plus else ""
+
         # header
         if extra.get("catch_up"):
             lines.append(f"🔔 {et}  •  CATCH-UP ALERT")
             lines.append("⏩ Signal fired earlier — act only if levels still valid")
         else:
-            lines.append(f"🔔 {et}  •  {direction}")
+            lines.append(f"🔔 {et}  •  {module_tag}{direction}")
 
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
         lines.append(f"⏰ {event.timestamp.strftime('%H:%M IST')}  |  Action: {action}")
@@ -351,7 +377,10 @@ class TelegramAlerter:
             lines.append("  Strike/quote unavailable — check broker app")
 
         lines.append("")
-        lines.append(f"✅ Filters: {event.reason}")
+        if is_j_plus:
+            lines.append(f"✅ Module: J+  |  Filters: {event.reason}")
+        else:
+            lines.append(f"✅ Filters: {event.reason}")
 
         return "\n".join(lines)
 

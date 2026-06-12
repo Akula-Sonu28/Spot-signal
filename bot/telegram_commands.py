@@ -14,7 +14,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from bot.alerts import TelegramAlerter, _urlopen
-from bot.config import AppConfig
+from bot.config import AppConfig, load_combined_config
 from bot.platform_paths import (
     default_market_session_script,
     popen_session_kwargs,
@@ -318,6 +318,8 @@ class TelegramCommandHandler:
                 lpc_str = "—  (no bars processed yet)"
             lines.append(f"Last bar: {lpc_str}")
 
+            combined = self.cfg.combined or load_combined_config(self.cfg.strategy)
+
             # Opening range
             if day and day.or_defined:
                 or_width = round((day.or_high or 0) - (day.or_low or 0), 2)
@@ -328,16 +330,27 @@ class TelegramCommandHandler:
             else:
                 lines.append("OR:       Not defined yet")
 
+            if day and day.day_mode:
+                mode_label = day.day_mode
+                if day.day_mode == "J_PLUS" and not combined.enable_j_plus:
+                    mode_label = "J+ disabled (no entries)"
+                lines.append(f"Mode:     {mode_label}")
+
             # Today's trades
             if day:
                 t = day.trades_today
+                max_trades = (
+                    combined.j_trap.max_trades_day
+                    if day.day_mode == "J_PLUS"
+                    else self.cfg.strategy.max_trades_per_day
+                )
                 fired = []
                 if day.fired_long_today:
                     fired.append("CE")
                 if day.fired_short_today:
                     fired.append("PE")
                 fired_str = " + ".join(fired) if fired else "none"
-                lines.append(f"Trades:   {t}/2 today  ({fired_str})")
+                lines.append(f"Trades:   {t}/{max_trades} today  ({fired_str})")
 
             # Current position
             if pos.side != PositionSide.FLAT:

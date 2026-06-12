@@ -133,7 +133,7 @@ def main() -> None:
     session_str = session.isoformat()
 
     print("=" * 60)
-    print(f"NIFTY v3.7 — Today check ({session_str} IST)")
+    print(f"NIFTY v3.9 — Today check ({session_str} IST)")
     print("=" * 60)
 
     fut_key, df = build_replay_dataframe(session, token=token)
@@ -209,11 +209,11 @@ def main() -> None:
     entries = [e for e in today_events if e.event_type in ("BUY_CE", "BUY_PE")]
     print("\n--- Verdict ---")
     if entries:
-        print(f"  {len(entries)} signal(s) fired — compare marks on TradingView v3.7 chart.")
+        print(f"  {len(entries)} signal(s) fired — compare marks on TradingView v3.9 chart.")
     else:
         print("  No signal today — valid if filters blocked (OR break + VWAP + ADX).")
         print("  Compare OR box and VWAP on TV; today had sustained trade below OR + below VWAP.")
-    print("  Next: open NIFTY 5m TV with locked v3.7 and verify same direction.")
+    print("  Next: open NIFTY 5m TV with locked v3.9 and verify same direction.")
     print("=" * 60)
 
 

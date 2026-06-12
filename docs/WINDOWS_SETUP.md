@@ -46,7 +46,7 @@ Task Scheduler (Mon–Fri 09:10) — hidden, no window
             ├── SetThreadExecutionState (prevent sleep)
             └── py/python -m bot.main
                     ├── Upstox REST (SSL fallback)
-                    ├── strategy.py (v3.7 rules)
+                    ├── combined.py (v3.9 day router)
                     └── Telegram alerts (enhanced formatting)
 ```
 
@@ -122,6 +122,23 @@ TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
 TELEGRAM_CHAT_ID=your_numeric_chat_id_here
 AUTO_TRADE=false
 ```
+
+### Strategy v3.9 (optional overrides)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ENABLE_J_PLUS` | `true` | J+ trap-fade on wide-OR days (`>100` pts) |
+| `J_MIN_TRAP_EXCESS` | `15` | Minimum trap wick beyond OR |
+| `J_MIN_RECLAIM_PTS` | `8` | Minimum reclaim inside OR |
+| `J_MIN_VWAP_DIST` | `8` | Minimum distance from VWAP |
+| `J_MIN_BODY_RATIO` | `0.4` | Minimum candle body ratio |
+| `J_ADX_MIN` | `20` | ADX floor for J+ |
+| `J_MINS_AFTER_OR` | `30` | Earliest J+ entry (~10:00 IST) |
+| `J_MAX_TRADES_DAY` | `1` | Max J+ trades per session |
+| `J_MAX_LOSSES_DAY` | `1` | Stop J+ after one loss |
+| `J_SKIP_BOTH_TRAPPED` | `true` | Skip if both OR sides trapped |
+
+Set `ENABLE_J_PLUS=false` for v3.8-only behavior. See [LOCKED_STRATEGY_v3.9.md](LOCKED_STRATEGY_v3.9.md).
 
 ## Smoke tests (before scheduling)
 

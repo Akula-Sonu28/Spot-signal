@@ -191,13 +191,16 @@ def check_exit_and_log(
     pos_copy_stop = pos.stop
     pos_copy_target = pos.target
 
+    from bot.config import DEFAULT_CONFIG
+
     snap = Position(
         side=pos_copy_side,
         entry_price=pos_copy_entry,
         stop=pos_copy_stop,
         target=pos_copy_target,
+        entry_bar_index=pos.entry_bar_index,
     )
-    exited = _check_exit_on_bar(snap, bar, temp)
+    exited = _check_exit_on_bar(snap, bar, temp, DEFAULT_CONFIG)
 
     if not exited:
         if bar.is_square_off:

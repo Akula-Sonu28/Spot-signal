@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from bot.config import DEFAULT_CONFIG
+from bot.config import DEFAULT_CONFIG, StrategyConfig
 from bot.logger import ReplayLogger
 from bot.replay import load_candles_csv, run_replay_fast
 from bot.state import PositionSide
@@ -114,7 +114,8 @@ def test_same_bar_sl_priority_via_strategy():
         atr=2.0,
         adx=20.0,
     )
-    process_bar(state, bar, logger)
+    cfg = StrategyConfig(close_only_sl=False)
+    process_bar(state, bar, logger, cfg)
     assert logger.events[-1].event_type == "SL_CE"
 
 

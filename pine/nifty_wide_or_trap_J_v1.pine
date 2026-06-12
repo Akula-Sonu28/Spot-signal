@@ -1,0 +1,364 @@
+//@version=6
+// =============================================================================
+// NIFTY WIDE-OR TRAP — Setup J (research / visual validation)
+// =============================================================================
+// Phase-2 for days v3.8 skips (OR width > 100). Matches research/backtests/
+// non_trade_setups.py :: process_or_fake_break_stack + capped_stops exits.
+//
+// PE (short): wick above OR high → close back inside OR + below VWAP + ADX +
+//             bearish candle → fade the fake breakout
+// CE (long):  wick below OR low  → close back inside OR + above VWAP + ADX +
+//             bullish candle → fade the fake breakdown
+//
+// Chart: NIFTY 5m, timezone Asia/Kolkata. Compare orange wide-OR days vs v3.8.
+// J+ robust filters (default ON): sweep winner robust_v3 — fewer, higher-PF trades.
+// =============================================================================
+
+strategy(
+     "NIFTY Wide-OR Trap J+ v1",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 100000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 100,
+     commission_type = strategy.commission.cash_per_order,
+     commission_value = 40,
+     slippage = 2,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     max_bars_back = 500,
+     currency = currency.INR
+)
+
+const string grpORB     = "1. Opening Range"
+const string grpFilter  = "2. Trap Filters"
+const string grpRobust  = "2b. J+ Robust (fewer, higher PF)"
+const string grpRisk    = "3. Stop & Target (research)"
+const string grpSession = "4. Session"
+const string grpVisual  = "5. Visuals"
+
+//=============================================================================
+// INPUTS
+//=============================================================================
+int orMinutes        = input.int(15, "OR duration (minutes)", minval = 5, maxval = 60, step = 5, group = grpORB)
+float wideOrMin      = input.float(100.0, "Wide OR minimum (pts) — activate trap", minval = 80, step = 5, group = grpORB,
+     tooltip = "Must be > v3.8 max OR (100). Only trade when final OR width exceeds this.")
+float v38MaxOr       = input.float(100.0, "v3.8 max OR (reference band)", minval = 50, step = 5, group = grpORB,
+     tooltip = "For visual compare: green = v3.8 trade band 25–100")
+
+bool useRobustMode   = input.bool(true, "J+ robust filters (recommended)", group = grpRobust,
+     tooltip = "OFF = raw Setup J. ON = sweep winner (PF ~3.8 on Mar–Jun 2026).")
+float minTrapExcess  = input.float(15.0, "Min trap wick beyond OR (pts)", minval = 0, step = 5, group = grpRobust)
+float minReclaimPts  = input.float(8.0, "Min close inside OR (pts)", minval = 0, step = 2, group = grpRobust)
+float minVwapDist    = input.float(8.0, "Min VWAP distance (pts)", minval = 0, step = 2, group = grpRobust)
+float minBodyRatio   = input.float(0.4, "Min reversal body / range", minval = 0, maxval = 1, step = 0.05, group = grpRobust)
+int minMinsAfterOr   = input.int(30, "Min minutes after OR ends", minval = 0, step = 5, group = grpRobust)
+bool skipBothTrapped = input.bool(true, "Skip day if both OR sides trapped", group = grpRobust)
+int maxLossesDay     = input.int(1, "Max losses per day (0=off)", minval = 0, maxval = 3, group = grpRobust)
+
+bool useAdxFilter    = input.bool(true, "ADX filter", group = grpFilter)
+int adxLen           = input.int(14, "ADX length", minval = 5, group = grpFilter)
+float adxMinThresh   = input.float(18.0, "Min ADX (base J)", minval = 10, step = 1, group = grpFilter)
+float adxMinRobust   = input.float(20.0, "Min ADX (J+ when robust ON)", minval = 10, step = 1, group = grpRobust)
+bool requireVwap     = input.bool(true, "VWAP wrong-side confirm", group = grpFilter,
+     tooltip = "PE: close below VWAP. CE: close above VWAP.")
+
+bool closeOnlySl     = input.bool(true, "Close-only SL", group = grpRisk)
+float slBufferPts    = input.float(10.0, "SL buffer beyond trap wick (pts)", minval = 0, step = 5, group = grpRisk)
+float atrSlMult      = input.float(1.4, "ATR cap on stop distance", minval = 0.5, maxval = 5.0, step = 0.1, group = grpRisk)
+float rrRatio        = input.float(2.0, "RR ratio (target = risk × RR)", minval = 0.5, maxval = 5.0, step = 0.1, group = grpRisk)
+int atrLen           = input.int(14, "ATR length", minval = 5, group = grpRisk)
+
+string tzInput       = input.string("Asia/Kolkata", "Timezone", group = grpSession)
+int squareOffH         = input.int(15, "Square-off hour", minval = 13, maxval = 15, group = grpSession)
+int squareOffM         = input.int(15, "Square-off minute", minval = 0, maxval = 59, group = grpSession)
+int maxTradesDay     = input.int(1, "Max trades per day", minval = 1, maxval = 5, group = grpSession)
+string tradeDirection = input.string("Both", "Direction", options = ["Both", "Long Only (CE)", "Short Only (PE)"], group = grpSession)
+
+bool showOrLines     = input.bool(true, "OR high/low lines", group = grpVisual)
+bool showVwap        = input.bool(true, "VWAP", group = grpVisual)
+bool showLevels      = input.bool(true, "Active SL / Target", group = grpVisual)
+bool showTrapMarks   = input.bool(true, "Trap wick touch markers", group = grpVisual)
+bool showEntries     = input.bool(true, "Entry markers", group = grpVisual)
+bool showDayBands    = input.bool(true, "Day type bands (v3.8 vs wide OR)", group = grpVisual)
+bool showDash        = input.bool(true, "Dashboard", group = grpVisual)
+
+//=============================================================================
+// INDICATORS & TIME
+//=============================================================================
+float vwapVal = ta.vwap(hlc3)
+float atrVal  = ta.atr(atrLen)
+[_, _, adxVal] = ta.dmi(adxLen, adxLen)
+float adxFloor = useRobustMode ? adxMinRobust : adxMinThresh
+bool adxOk = not useAdxFilter or adxVal >= adxFloor
+
+int barMin     = hour(time_close, tzInput) * 60 + minute(time_close, tzInput)
+int marketOpen = 9 * 60 + 15
+int orEndMin   = marketOpen + orMinutes
+int sqOffMin   = squareOffH * 60 + squareOffM
+
+bool isInOR       = barMin >= marketOpen and barMin < orEndMin
+bool isAfterOR    = barMin >= orEndMin
+bool isSquareOff  = barMin >= sqOffMin
+bool isEntryWindow = isAfterOR and not isSquareOff
+
+//=============================================================================
+// OPENING RANGE
+//=============================================================================
+var float orHigh = na
+var float orLow  = na
+var bool orDefined = false
+
+bool isDayChange = ta.change(time("D")) != 0
+
+if isDayChange
+    orHigh := na
+    orLow := na
+    orDefined := false
+
+if isInOR
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow) ? low : math.min(orLow, low)
+
+if isAfterOR and not na(orHigh) and not na(orLow)
+    orDefined := true
+
+float orRange   = orDefined ? orHigh - orLow : na
+bool isWideOr   = orDefined and not na(orRange) and orRange > wideOrMin
+bool isV38Band  = orDefined and not na(orRange) and orRange >= 25 and orRange <= v38MaxOr
+
+//=============================================================================
+// TRAP STATE (Setup J flags)
+//=============================================================================
+var bool touchedAbove = false
+var bool touchedBelow = false
+var float trapHigh = na
+var float trapLow  = na
+var int tradesToday = 0
+var int lossesToday = 0
+var bool firedCe = false
+var bool firedPe = false
+
+if isDayChange
+    touchedAbove := false
+    touchedBelow := false
+    trapHigh := na
+    trapLow := na
+    tradesToday := 0
+    lossesToday := 0
+    firedCe := false
+    firedPe := false
+
+// Track wick traps only on wide-OR days after OR forms
+if barstate.isconfirmed and isWideOr and isEntryWindow and orDefined
+    if high > orHigh and not touchedAbove
+        touchedAbove := true
+        trapHigh := high
+    if low < orLow and not touchedBelow
+        touchedBelow := true
+        trapLow := low
+    if touchedAbove
+        trapHigh := math.max(nz(trapHigh, high), high)
+    if touchedBelow
+        trapLow := math.min(nz(trapLow, low), low)
+
+//=============================================================================
+// ENTRY SIGNALS (match Python process_or_fake_break_stack)
+//=============================================================================
+bool vwapPeOk = not requireVwap or close < vwapVal
+bool vwapCeOk = not requireVwap or close > vwapVal
+bool bearBar = close < open
+bool bullBar = close > open
+
+float barRange = math.max(high - low, syminfo.mintick)
+float bodyBear = (open - close) / barRange
+float bodyBull = (close - open) / barRange
+float trapExcessPe = nz(trapHigh, high) - orHigh
+float trapExcessCe = orLow - nz(trapLow, low)
+float reclaimPe = orHigh - close
+float reclaimCe = close - orLow
+float vwapDistPe = vwapVal - close
+float vwapDistCe = close - vwapVal
+
+float trapExMin = useRobustMode ? minTrapExcess : 0.0
+float reclaimMin = useRobustMode ? minReclaimPts : 0.0
+float vwapDistMin = useRobustMode ? minVwapDist : 0.0
+float bodyMin = useRobustMode ? minBodyRatio : 0.0
+bool timeOk = not useRobustMode or (barMin - orEndMin) >= minMinsAfterOr
+bool chopDay = useRobustMode and skipBothTrapped and touchedAbove and touchedBelow
+
+bool peTrapSignal = barstate.isconfirmed and isWideOr and isEntryWindow and orDefined and timeOk and not chopDay
+     and touchedAbove
+     and close < orHigh
+     and vwapPeOk
+     and adxOk
+     and bearBar
+     and trapExcessPe >= trapExMin
+     and reclaimPe >= reclaimMin
+     and vwapDistPe >= vwapDistMin
+     and bodyBear >= bodyMin
+
+bool ceTrapSignal = barstate.isconfirmed and isWideOr and isEntryWindow and orDefined and timeOk and not chopDay
+     and touchedBelow
+     and close > orLow
+     and vwapCeOk
+     and adxOk
+     and bullBar
+     and trapExcessCe >= trapExMin
+     and reclaimCe >= reclaimMin
+     and vwapDistCe >= vwapDistMin
+     and bodyBull >= bodyMin
+
+bool dirCeOk = tradeDirection != "Short Only (PE)"
+bool dirPeOk = tradeDirection != "Long Only (CE)"
+bool lossOk = not useRobustMode or maxLossesDay == 0 or lossesToday < maxLossesDay
+bool canTrade = tradesToday < maxTradesDay and strategy.position_size == 0 and lossOk
+
+bool buyPe = peTrapSignal and canTrade and not firedPe and dirPeOk
+bool buyCe = ceTrapSignal and canTrade and not firedCe and dirCeOk
+
+//=============================================================================
+// STOPS / TARGETS (capped_stops — structure + ATR cap, RR target)
+//=============================================================================
+f_peStop(float entry) =>
+    float structure = math.max(nz(trapHigh, high), high) + slBufferPts
+    float cap = entry + atrVal * atrSlMult
+    math.min(structure, cap)
+
+f_ceStop(float entry) =>
+    float structure = math.min(nz(trapLow, low), low) - slBufferPts
+    float cap = entry - atrVal * atrSlMult
+    math.max(structure, cap)
+
+f_peTarget(float entry, float stop) =>
+    float risk = stop - entry
+    risk > 0 ? entry - risk * rrRatio : na
+
+f_ceTarget(float entry, float stop) =>
+    float risk = entry - stop
+    risk > 0 ? entry + risk * rrRatio : na
+
+var float activeEntry  = na
+var float activeStop   = na
+var float activeTarget = na
+
+bool justFlat = strategy.position_size == 0 and nz(strategy.position_size[1]) != 0
+if justFlat
+    activeEntry := na
+    activeStop := na
+    activeTarget := na
+    if strategy.closedtrades > 0 and strategy.closedtrades.profit(strategy.closedtrades - 1) < 0
+        lossesToday += 1
+
+//=============================================================================
+// EXITS
+//=============================================================================
+if not closeOnlySl and strategy.position_size > 0 and not na(activeStop) and not na(activeTarget)
+    strategy.exit("CE_EXIT", from_entry = "BUY_CE", stop = activeStop, limit = activeTarget, disable_alert = true)
+
+if not closeOnlySl and strategy.position_size < 0 and not na(activeStop) and not na(activeTarget)
+    strategy.exit("PE_EXIT", from_entry = "BUY_PE", stop = activeStop, limit = activeTarget, disable_alert = true)
+
+if closeOnlySl and strategy.position_size > 0 and not na(activeTarget)
+    strategy.exit("CE_TGT", from_entry = "BUY_CE", limit = activeTarget, disable_alert = true)
+
+if closeOnlySl and strategy.position_size < 0 and not na(activeTarget)
+    strategy.exit("PE_TGT", from_entry = "BUY_PE", limit = activeTarget, disable_alert = true)
+
+if closeOnlySl and barstate.isconfirmed and strategy.position_size > 0 and not na(activeStop) and close <= activeStop
+    strategy.close("BUY_CE", comment = "SL CE")
+
+if closeOnlySl and barstate.isconfirmed and strategy.position_size < 0 and not na(activeStop) and close >= activeStop
+    strategy.close("BUY_PE", comment = "SL PE")
+
+if barstate.isconfirmed and isSquareOff and strategy.position_size != 0
+    strategy.close_all(comment = "EOD")
+
+//=============================================================================
+// ENTRIES
+//=============================================================================
+if buyCe
+    float sl = f_ceStop(close)
+    float tg = f_ceTarget(close, sl)
+    if not na(tg) and close > sl
+        activeEntry := close
+        activeStop := sl
+        activeTarget := tg
+        strategy.entry("BUY_CE", strategy.long, comment = "J CE trap")
+        tradesToday += 1
+        firedCe := true
+
+if buyPe
+    float sl = f_peStop(close)
+    float tg = f_peTarget(close, sl)
+    if not na(tg) and sl > close
+        activeEntry := close
+        activeStop := sl
+        activeTarget := tg
+        strategy.entry("BUY_PE", strategy.short, comment = "J PE trap")
+        tradesToday += 1
+        firedPe := true
+
+//=============================================================================
+// VISUALS
+//=============================================================================
+plot(showOrLines and orDefined ? orHigh : na, "OR High", color = color.new(color.green, 30), linewidth = 2, style = plot.style_linebr)
+plot(showOrLines and orDefined ? orLow : na, "OR Low", color = color.new(color.red, 30), linewidth = 2, style = plot.style_linebr)
+plot(showVwap ? vwapVal : na, "VWAP", color = color.new(color.blue, 40), linewidth = 1)
+
+plot(showLevels and strategy.position_size != 0 ? activeStop : na, "SL", color = color.red, style = plot.style_linebr, linewidth = 2)
+plot(showLevels and strategy.position_size != 0 ? activeTarget : na, "Target", color = color.lime, style = plot.style_linebr, linewidth = 2)
+
+// Day-type bands: green tint = v3.8 band, orange = wide OR (Setup J)
+bgcolor(showDayBands and orDefined and isV38Band and isEntryWindow ? color.new(color.green, 94) : na, title = "v3.8 OR band")
+bgcolor(showDayBands and orDefined and isWideOr and isEntryWindow ? color.new(color.orange, 92) : na, title = "Wide OR (J active)")
+bgcolor(isInOR ? color.new(color.yellow, 93) : na, title = "OR forming")
+
+// Trap touch (first wick beyond OR)
+bool newAboveTouch = barstate.isconfirmed and isWideOr and isEntryWindow and high > orHigh and not touchedAbove[1]
+bool newBelowTouch = barstate.isconfirmed and isWideOr and isEntryWindow and low < orLow and not touchedBelow[1]
+
+plotshape(showTrapMarks and newAboveTouch, title = "Trap above OR", text = "↑trap", style = shape.triangledown,
+     location = location.abovebar, color = color.orange, textcolor = color.white, size = size.tiny)
+plotshape(showTrapMarks and newBelowTouch, title = "Trap below OR", text = "↓trap", style = shape.triangleup,
+     location = location.belowbar, color = color.orange, textcolor = color.white, size = size.tiny)
+
+plotshape(showEntries and buyPe, title = "J PE", text = "J PE", style = shape.labeldown,
+     location = location.abovebar, color = color.red, textcolor = color.white, size = size.small)
+plotshape(showEntries and buyCe, title = "J CE", text = "J CE", style = shape.labelup,
+     location = location.belowbar, color = color.green, textcolor = color.white, size = size.small)
+
+//=============================================================================
+// DASHBOARD
+//=============================================================================
+var table dash = table.new(position.top_right, 2, 10, border_width = 1)
+
+f_cell(int row, string lbl, string val, color bg) =>
+    table.cell(dash, 0, row, lbl, bgcolor = color.new(color.black, 10), text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, row, val, bgcolor = bg, text_color = color.white, text_size = size.small)
+
+if barstate.islast and showDash
+    string dayType = not orDefined ? "OR forming" : isWideOr ? "WIDE OR → J ON" : isV38Band ? "v3.8 band" : str.tostring(orRange, "#") + " pts"
+    color dayBg = isWideOr ? color.new(color.orange, 0) : isV38Band ? color.new(color.green, 0) : color.new(color.gray, 40)
+
+    string trapTxt = touchedAbove and touchedBelow ? "Both sides" : touchedAbove ? "Above (PE ready)" : touchedBelow ? "Below (CE ready)" : "None"
+    color trapBg = touchedAbove or touchedBelow ? color.new(color.orange, 20) : color.new(color.gray, 50)
+
+    string adxTxt = str.tostring(adxVal, "#.#") + (adxOk ? " ✓" : " ✗")
+    color adxBg = adxOk ? color.new(color.green, 0) : color.new(color.red, 0)
+
+    string vwapTxt = close > vwapVal ? "Above" : "Below"
+    string modeTxt = useRobustMode ? "J+ robust" : "J base"
+    f_cell(0, "Setup", modeTxt, color.new(color.orange, 30))
+    f_cell(1, "OR width", orDefined ? str.tostring(orRange, "#.#") + " pts" : "—", dayBg)
+    f_cell(2, "Day type", dayType, dayBg)
+    f_cell(3, "Trap state", trapTxt, trapBg)
+    f_cell(4, "ADX", adxTxt, adxBg)
+    f_cell(5, "VWAP", vwapTxt, close > vwapVal ? color.new(color.green, 0) : color.new(color.red, 0))
+    f_cell(6, "Trades", str.tostring(tradesToday) + "/" + str.tostring(maxTradesDay), color.new(color.gray, 30))
+    f_cell(7, "Position", strategy.position_size > 0 ? "CE" : strategy.position_size < 0 ? "PE" : "Flat", color.new(color.gray, 30))
+    f_cell(8, "Exit", "Struct+ATR cap RR" + str.tostring(rrRatio, "#.#"), color.new(color.blue, 30))
+    f_cell(9, "Session", isEntryWindow ? "Live" : isSquareOff ? "EOD" : "Closed", color.new(color.gray, 30))
+
+alertcondition(buyCe, title = "J BUY CE", message = "Wide-OR trap: fake breakdown fade — CE")
+alertcondition(buyPe, title = "J BUY PE", message = "Wide-OR trap: fake breakout fade — PE")

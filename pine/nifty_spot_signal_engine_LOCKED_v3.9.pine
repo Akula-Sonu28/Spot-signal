@@ -1,0 +1,386 @@
+//@version=6
+// =============================================================================
+// NIFTY SPOT SIGNAL ENGINE — LOCKED v3.9 (v3.8 + J+ day router)
+// =============================================================================
+// Built per .agents/skills/pine-developer — Pine Script v6 production standards.
+// Parity: bot/combined.py, bot/strategy.py (v3.8), bot/strategy_j.py (J+).
+// Docs: docs/LOCKED_STRATEGY_v3.9.md
+//
+// Router (after 15-min OR, fixed for session):
+//   OR < 25 pts     → SKIP
+//   OR 25–100 pts   → v3.8 only (max 2 trades/day)
+//   OR > 100 pts    → J+ only (max 1 trade/day, robust filters)
+//
+// Chart: NIFTY 5m, timezone Asia/Kolkata.
+// Python compare: scripts/backtest_pine_compare.py --j-mode robust
+// =============================================================================
+
+strategy(
+     "NIFTY Spot Signal Engine LOCKED v3.9",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 100000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 100,
+     commission_type = strategy.commission.cash_per_order,
+     commission_value = 40,
+     slippage = 2,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     max_bars_back = 500,
+     currency = currency.INR
+)
+
+const string grpRouter  = "0. Day router"
+const string grpORB     = "1. Opening Range"
+const string grpV38     = "2. v3.8 (OR 25–100)"
+const string grpJ       = "3. J+ (OR > 100)"
+const string grpRisk    = "4. Exits (shared)"
+const string grpSession = "5. Session"
+const string grpVisual  = "6. Visuals"
+
+//=============================================================================
+// INPUTS
+//=============================================================================
+float minOrRange = input.float(25.0, "Min OR (pts) — skip below", minval = 10, step = 5, group = grpORB,
+     tooltip = "Days with OR width below this are skipped entirely.")
+float maxOrRange = input.float(100.0, "Max OR for v3.8 (pts)", minval = 50, step = 5, group = grpORB,
+     tooltip = "v3.8 trades when OR width is between Min OR and this value (inclusive).")
+float wideOrMin = input.float(100.0, "Wide OR min for J+ (pts)", minval = 80, step = 5, group = grpORB,
+     tooltip = "J+ activates only when OR width is strictly greater than this value.")
+int orMinutes = input.int(15, "OR duration (min)", minval = 5, maxval = 60, step = 5, group = grpORB)
+
+bool showRouterLabel = input.bool(true, "Show day-mode label when OR completes", group = grpRouter)
+
+bool v38UseVwap = input.bool(true, "v3.8 VWAP alignment", group = grpV38)
+float v38AdxMin = input.float(18.0, "v3.8 min ADX", minval = 10, step = 1, group = grpV38)
+int v38MaxTrades = input.int(2, "v3.8 max trades/day", minval = 1, maxval = 3, group = grpV38)
+
+float jTrapExcess = input.float(15.0, "J+ min trap wick beyond OR (pts)", minval = 0, step = 5, group = grpJ)
+float jReclaimPts = input.float(8.0, "J+ min close inside OR (pts)", minval = 0, step = 2, group = grpJ)
+float jVwapDist = input.float(8.0, "J+ min VWAP distance (pts)", minval = 0, step = 2, group = grpJ)
+float jBodyRatio = input.float(0.4, "J+ min reversal body / range", minval = 0, maxval = 1, step = 0.05, group = grpJ)
+float jAdxMin = input.float(20.0, "J+ min ADX", minval = 10, step = 1, group = grpJ)
+int jMinsAfterOr = input.int(30, "J+ min minutes after OR ends", minval = 0, step = 5, group = grpJ)
+bool jSkipBothTrap = input.bool(true, "J+ skip day if both OR sides trapped", group = grpJ)
+int jMaxTrades = input.int(1, "J+ max trades/day", minval = 1, maxval = 2, group = grpJ)
+int jMaxLosses = input.int(1, "J+ max losses/day (0 = off)", minval = 0, maxval = 3, group = grpJ)
+
+bool closeOnlySl = input.bool(true, "Close-only stop loss", group = grpRisk)
+float slBufferPts = input.float(10.0, "SL buffer (pts)", minval = 0, step = 5, group = grpRisk)
+float atrSlMult = input.float(1.4, "ATR SL cap multiplier (J+)", minval = 0.5, step = 0.1, group = grpRisk)
+float atrTargetMult = input.float(1.2, "ATR target multiplier (v3.8)", minval = 0.5, step = 0.1, group = grpRisk)
+float rrRatio = input.float(2.0, "Reward-risk ratio", minval = 0.5, step = 0.1, group = grpRisk)
+int atrLen = input.int(14, "ATR length", minval = 5, group = grpRisk)
+int adxLen = input.int(14, "ADX length", minval = 5, group = grpRisk)
+
+string tzInput = input.string("Asia/Kolkata", "Timezone", group = grpSession)
+int squareOffH = input.int(15, "Square-off hour", minval = 13, maxval = 15, group = grpSession)
+int squareOffM = input.int(15, "Square-off minute", minval = 0, maxval = 59, group = grpSession)
+
+bool showOrLines = input.bool(true, "Show OR lines and VWAP", group = grpVisual)
+bool showBands = input.bool(true, "Day-mode background tint", group = grpVisual)
+bool showMarkers = input.bool(true, "Entry markers", group = grpVisual)
+bool showDash = input.bool(true, "Dashboard table", group = grpVisual)
+
+//=============================================================================
+// INDICATORS & SESSION
+//=============================================================================
+float vwapVal = ta.vwap(hlc3)
+float atrVal = ta.atr(atrLen)
+[_, _, adxVal] = ta.dmi(adxLen, adxLen)
+
+int barMin = hour(time_close, tzInput) * 60 + minute(time_close, tzInput)
+int marketOpen = 9 * 60 + 15
+int orEndMin = marketOpen + orMinutes
+int sqOffMin = squareOffH * 60 + squareOffM
+
+bool isInOR = barMin >= marketOpen and barMin < orEndMin
+bool isAfterOR = barMin >= orEndMin
+bool isSquareOff = barMin >= sqOffMin
+bool isEntryWindow = isAfterOR and not isSquareOff
+
+//=============================================================================
+// OPENING RANGE
+//=============================================================================
+var float orHigh = na
+var float orLow = na
+var bool orDefined = false
+
+bool isDayChange = ta.change(time("D")) != 0
+
+if isDayChange
+    orHigh := na
+    orLow := na
+    orDefined := false
+
+if isInOR
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow := na(orLow) ? low : math.min(orLow, low)
+
+if isAfterOR and not na(orHigh) and not na(orLow)
+    orDefined := true
+
+float orRange = orDefined ? orHigh - orLow : na
+
+bool isSkipDay = orDefined and not na(orRange) and orRange < minOrRange
+bool isV38Day = orDefined and not na(orRange) and orRange >= minOrRange and orRange <= maxOrRange
+bool isJDay = orDefined and not na(orRange) and orRange > wideOrMin
+
+//=============================================================================
+// DAILY STATE
+//=============================================================================
+var int v38TradesToday = 0
+var int jTradesToday = 0
+var int jLossesToday = 0
+var bool v38FiredLong = false
+var bool v38FiredShort = false
+var bool jFiredCe = false
+var bool jFiredPe = false
+
+var bool touchedAbove = false
+var bool touchedBelow = false
+var float trapHigh = na
+var float trapLow = na
+
+var string activeModule = "NONE"
+var float activeEntry = na
+var float activeStop = na
+var float activeTarget = na
+
+if isDayChange
+    v38TradesToday := 0
+    jTradesToday := 0
+    jLossesToday := 0
+    v38FiredLong := false
+    v38FiredShort := false
+    jFiredCe := false
+    jFiredPe := false
+    touchedAbove := false
+    touchedBelow := false
+    trapHigh := na
+    trapLow := na
+    activeModule := "NONE"
+
+bool isFlat = strategy.position_size == 0
+bool justFlat = isFlat and nz(strategy.position_size[1]) != 0
+
+if justFlat
+    activeEntry := na
+    activeStop := na
+    activeTarget := na
+    bool lastLoss = strategy.closedtrades > 0 and strategy.closedtrades.profit(strategy.closedtrades - 1) < 0
+    if activeModule == "J" and lastLoss
+        jLossesToday += 1
+    activeModule := "NONE"
+
+//=============================================================================
+// J+ TRAP TRACKING (J days only)
+//=============================================================================
+if barstate.isconfirmed and isJDay and isEntryWindow
+    if high > orHigh
+        if not touchedAbove
+            touchedAbove := true
+            trapHigh := high
+        trapHigh := math.max(nz(trapHigh, high), high)
+    if low < orLow
+        if not touchedBelow
+            touchedBelow := true
+            trapLow := low
+        trapLow := math.min(nz(trapLow, low), low)
+
+//=============================================================================
+// v3.8 SIGNALS (v3.8 days only — mutually exclusive with J+)
+//=============================================================================
+bool v38AdxOk = adxVal >= v38AdxMin
+bool v38VwapLong = not v38UseVwap or close > vwapVal
+bool v38VwapShort = not v38UseVwap or close < vwapVal
+
+bool v38LongBreak = barstate.isconfirmed and isV38Day and isEntryWindow and
+     close > orHigh and v38VwapLong and v38AdxOk
+bool v38ShortBreak = barstate.isconfirmed and isV38Day and isEntryWindow and
+     close < orLow and v38VwapShort and v38AdxOk
+
+bool v38CanTrade = isFlat and v38TradesToday < v38MaxTrades
+bool v38BuyCe = v38LongBreak and v38CanTrade and not v38FiredLong
+bool v38BuyPe = v38ShortBreak and v38CanTrade and not v38FiredShort
+
+float v38LongStop = orLow - slBufferPts
+float v38ShortStop = orHigh + slBufferPts
+float v38LongTgt = close + atrVal * atrTargetMult * rrRatio
+float v38ShortTgt = close - atrVal * atrTargetMult * rrRatio
+
+//=============================================================================
+// J+ SIGNALS (J days only)
+//=============================================================================
+float barRange = math.max(high - low, syminfo.mintick)
+float bodyBear = (open - close) / barRange
+float bodyBull = (close - open) / barRange
+float trapExcessPe = nz(trapHigh, high) - orHigh
+float trapExcessCe = orLow - nz(trapLow, low)
+
+bool jTimeOk = (barMin - orEndMin) >= jMinsAfterOr
+bool jChop = jSkipBothTrap and touchedAbove and touchedBelow
+bool jLossOk = jMaxLosses == 0 or jLossesToday < jMaxLosses
+bool jCanTrade = isJDay and isEntryWindow and isFlat and jTradesToday < jMaxTrades and jLossOk
+
+bool jPeSignal = barstate.isconfirmed and jCanTrade and jTimeOk and not jChop and touchedAbove and
+     close < orHigh and close < vwapVal and adxVal >= jAdxMin and close < open and
+     trapExcessPe >= jTrapExcess and (orHigh - close) >= jReclaimPts and
+     (vwapVal - close) >= jVwapDist and bodyBear >= jBodyRatio
+
+bool jCeSignal = barstate.isconfirmed and jCanTrade and jTimeOk and not jChop and touchedBelow and
+     close > orLow and close > vwapVal and adxVal >= jAdxMin and close > open and
+     trapExcessCe >= jTrapExcess and (close - orLow) >= jReclaimPts and
+     (close - vwapVal) >= jVwapDist and bodyBull >= jBodyRatio
+
+bool jBuyPe = jPeSignal and not jFiredPe
+bool jBuyCe = jCeSignal and not jFiredCe
+
+f_jPeStop(float entry) =>
+    math.min(math.max(nz(trapHigh, high), high) + slBufferPts, entry + atrVal * atrSlMult)
+
+f_jCeStop(float entry) =>
+    math.max(math.min(nz(trapLow, low), low) - slBufferPts, entry - atrVal * atrSlMult)
+
+f_jTarget(float entry, float stop, bool isLong) =>
+    float risk = isLong ? entry - stop : stop - entry
+    float tgtLong = entry + risk * rrRatio
+    float tgtShort = entry - risk * rrRatio
+    risk > 0 ? (isLong ? tgtLong : tgtShort) : na
+
+//=============================================================================
+// EXITS
+//=============================================================================
+string ceEntryId = activeModule == "J" ? "J_BUY_CE" : "V38_BUY_CE"
+string peEntryId = activeModule == "J" ? "J_BUY_PE" : "V38_BUY_PE"
+
+if closeOnlySl and strategy.position_size > 0 and not na(activeTarget)
+    strategy.exit("CE_TGT", from_entry = ceEntryId, limit = activeTarget, disable_alert = true)
+
+if closeOnlySl and strategy.position_size < 0 and not na(activeTarget)
+    strategy.exit("PE_TGT", from_entry = peEntryId, limit = activeTarget, disable_alert = true)
+
+if closeOnlySl and barstate.isconfirmed and strategy.position_size > 0 and not na(activeStop) and close <= activeStop
+    strategy.close(ceEntryId, comment = "SL CE")
+
+if closeOnlySl and barstate.isconfirmed and strategy.position_size < 0 and not na(activeStop) and close >= activeStop
+    strategy.close(peEntryId, comment = "SL PE")
+
+if barstate.isconfirmed and isSquareOff and strategy.position_size != 0
+    strategy.close_all(comment = "EOD")
+
+//=============================================================================
+// ENTRIES (bar close only — process_orders_on_close)
+//=============================================================================
+if barstate.isconfirmed and v38BuyCe and close > v38LongStop
+    activeModule := "V38"
+    activeEntry := close
+    activeStop := v38LongStop
+    activeTarget := v38LongTgt
+    strategy.entry("V38_BUY_CE", strategy.long, comment = "38 CE")
+    v38TradesToday += 1
+    v38FiredLong := true
+
+if barstate.isconfirmed and v38BuyPe and v38ShortStop > close
+    activeModule := "V38"
+    activeEntry := close
+    activeStop := v38ShortStop
+    activeTarget := v38ShortTgt
+    strategy.entry("V38_BUY_PE", strategy.short, comment = "38 PE")
+    v38TradesToday += 1
+    v38FiredShort := true
+
+if barstate.isconfirmed and jBuyCe
+    float jSl = f_jCeStop(close)
+    float jTg = f_jTarget(close, jSl, true)
+    if not na(jTg) and close > jSl
+        activeModule := "J"
+        activeEntry := close
+        activeStop := jSl
+        activeTarget := jTg
+        strategy.entry("J_BUY_CE", strategy.long, comment = "J+ CE")
+        jTradesToday += 1
+        jFiredCe := true
+
+if barstate.isconfirmed and jBuyPe
+    float jSl = f_jPeStop(close)
+    float jTg = f_jTarget(close, jSl, false)
+    if not na(jTg) and jSl > close
+        activeModule := "J"
+        activeEntry := close
+        activeStop := jSl
+        activeTarget := jTg
+        strategy.entry("J_BUY_PE", strategy.short, comment = "J+ PE")
+        jTradesToday += 1
+        jFiredPe := true
+
+//=============================================================================
+// PLOTS (global scope only)
+//=============================================================================
+plot(showOrLines and orDefined ? orHigh : na, "OR High", color.new(color.green, 25), 2, plot.style_linebr)
+plot(showOrLines and orDefined ? orLow : na, "OR Low", color.new(color.red, 25), 2, plot.style_linebr)
+plot(showOrLines ? vwapVal : na, "VWAP", color.new(color.blue, 45))
+plot(strategy.position_size != 0 ? activeStop : na, "SL", color.red, 2, plot.style_linebr)
+plot(strategy.position_size != 0 ? activeTarget : na, "Target", color.lime, 2, plot.style_linebr)
+
+bgcolor(showBands and isInOR ? color.new(color.yellow, 93) : na, title = "OR window")
+bgcolor(showBands and isV38Day and isEntryWindow ? color.new(color.green, 94) : na, title = "v3.8 day")
+bgcolor(showBands and isJDay and isEntryWindow ? color.new(color.orange, 92) : na, title = "J+ day")
+bgcolor(showBands and isSkipDay and isEntryWindow ? color.new(color.gray, 92) : na, title = "Skip day")
+
+plotshape(showMarkers and v38BuyCe, title = "38 CE", text = "38 CE", style = shape.labelup,
+     location = location.belowbar, color = color.green, textcolor = color.white, size = size.small)
+plotshape(showMarkers and v38BuyPe, title = "38 PE", text = "38 PE", style = shape.labeldown,
+     location = location.abovebar, color = color.red, textcolor = color.white, size = size.small)
+plotshape(showMarkers and jBuyCe, title = "J+ CE", text = "J+ CE", style = shape.labelup,
+     location = location.belowbar, color = color.teal, textcolor = color.white, size = size.small)
+plotshape(showMarkers and jBuyPe, title = "J+ PE", text = "J+ PE", style = shape.labeldown,
+     location = location.abovebar, color = color.orange, textcolor = color.white, size = size.small)
+
+bool orJustDefined = barstate.isconfirmed and orDefined and not orDefined[1]
+if showRouterLabel and orJustDefined
+    string routerLbl = isJDay ? "J+ DAY" : isV38Day ? "v3.8 DAY" : "SKIP"
+    color routerCol = isJDay ? color.orange : isV38Day ? color.green : color.gray
+    string routerTxt = routerLbl + "\n" + str.tostring(orRange, "#") + " pts"
+    label.new(bar_index, high, routerTxt, style = label.style_label_down, color = routerCol, textcolor = color.white, size = size.small)
+
+//=============================================================================
+// DASHBOARD
+//=============================================================================
+var table dash = table.new(position.top_right, 2, 11, border_width = 1)
+
+f_cell(int row, string lbl, string val, color bg) =>
+    table.cell(dash, 0, row, lbl, bgcolor = color.new(color.black, 10), text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, row, val, bgcolor = bg, text_color = color.white, text_size = size.small)
+
+if barstate.islast and showDash
+    string dashMode = not orDefined ? "OR forming" : isJDay ? "J+ ONLY" : isV38Day ? "v3.8 ONLY" : isSkipDay ? "SKIP" : "—"
+    color dashModeBg = isJDay ? color.new(color.orange, 0) : isV38Day ? color.new(color.green, 0) : color.new(color.gray, 40)
+    string dashOther = isJDay ? "v3.8 OFF" : isV38Day ? "J+ OFF" : "both OFF"
+    string dashOr = orDefined ? str.tostring(orRange, "#.#") + " pts" : "—"
+    string dashPos = strategy.position_size > 0 ? "CE" : strategy.position_size < 0 ? "PE" : "Flat"
+    string dashTrap = "n/a"
+    if isJDay
+        dashTrap := touchedAbove and touchedBelow ? "Both" : touchedAbove ? "Above" : touchedBelow ? "Below" : "—"
+    string dashSess = isEntryWindow ? "Live" : isSquareOff ? "EOD" : "Closed"
+
+    f_cell(0, "Router", dashMode, dashModeBg)
+    f_cell(1, "OR width", dashOr, dashModeBg)
+    f_cell(2, "Other module", dashOther, color.new(color.gray, 30))
+    f_cell(3, "v3.8 trades", str.tostring(v38TradesToday) + "/" + str.tostring(v38MaxTrades), color.new(color.green, 40))
+    f_cell(4, "J+ trades", str.tostring(jTradesToday) + "/" + str.tostring(jMaxTrades), color.new(color.orange, 40))
+    f_cell(5, "ADX", str.tostring(adxVal, "#.#"), color.new(color.gray, 30))
+    f_cell(6, "Position", dashPos, color.new(color.gray, 30))
+    f_cell(7, "Open via", activeModule, color.new(color.blue, 30))
+    f_cell(8, "Trap", dashTrap, color.new(color.gray, 30))
+    f_cell(9, "Session", dashSess, color.new(color.gray, 30))
+    f_cell(10, "Overlap?", "Never same day", color.new(color.green, 50))
+
+//=============================================================================
+// ALERTS
+//=============================================================================
+alertcondition(v38BuyCe, "v3.8 BUY CE", "Combined: v3.8 day — CE breakout")
+alertcondition(v38BuyPe, "v3.8 BUY PE", "Combined: v3.8 day — PE breakdown")
+alertcondition(jBuyCe, "J+ BUY CE", "Combined: J+ day — trap fade CE")
+alertcondition(jBuyPe, "J+ BUY PE", "Combined: J+ day — trap fade PE")

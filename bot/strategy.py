@@ -1,4 +1,4 @@
-"""NIFTY Spot Signal Engine — v3.7 entries, OR_RANGE + close-only SL exits."""
+"""NIFTY Spot Signal Engine — v3.8 OR breakout entries, OR_RANGE + close-only SL exits."""
 
 from __future__ import annotations
 
@@ -261,46 +261,43 @@ def _check_exit_on_bar(
     return exited
 
 
-def process_bar(
+def _handle_square_off(
+    position: Position,
+    bar: BarContext,
+    logger: ReplayLogger,
+) -> bool:
+    if not bar.is_square_off or position.side == PositionSide.FLAT:
+        return False
+    side = position.side.value
+    direction = "LONG_EXIT" if position.side == PositionSide.CE else "SHORT_EXIT"
+    logger.log(
+        timestamp=bar.timestamp,
+        event_type="SQUARE_OFF",
+        direction=direction,
+        side=side,
+        price=bar.close,
+        stop=position.stop,
+        target=position.target,
+        reason="EOD_SQUARE_OFF",
+        bar_index=bar.index,
+        entry=position.entry_price,
+    )
+    reset_position(position)
+    return True
+
+
+def _process_v38_entries(
     state: ReplayState,
     bar: BarContext,
     logger: ReplayLogger,
-    cfg: StrategyConfig = DEFAULT_CONFIG,
+    cfg: StrategyConfig,
 ) -> None:
-    """Process one confirmed bar close (no look-ahead)."""
-    state.bar_index = bar.index
+    """v3.8 OR breakout entries (valid OR width only)."""
     day = state.day
-    if day is None:
-        raise RuntimeError("DayState must be initialized before process_bar")
-
-    update_or(day, bar, cfg)
+    if day is None or not day.or_defined or not bar.is_entry_window:
+        return
 
     position = state.position
-    if position.side != PositionSide.FLAT:
-        if _check_exit_on_bar(position, bar, logger, cfg):
-            return
-
-    if bar.is_square_off and position.side != PositionSide.FLAT:
-        side = position.side.value
-        direction = "LONG_EXIT" if position.side == PositionSide.CE else "SHORT_EXIT"
-        logger.log(
-            timestamp=bar.timestamp,
-            event_type="SQUARE_OFF",
-            direction=direction,
-            side=side,
-            price=bar.close,
-            stop=position.stop,
-            target=position.target,
-            reason="EOD_SQUARE_OFF",
-            bar_index=bar.index,
-            entry=position.entry_price,
-        )
-        reset_position(position)
-        return
-
-    if not day.or_defined or not bar.is_entry_window:
-        return
-
     width = or_width(day.or_high, day.or_low)
     or_width_ok = width is not None and cfg.min_or_range <= width <= cfg.max_or_range
     adx_ok = bar.adx is not None and bar.adx >= cfg.adx_min
@@ -341,7 +338,7 @@ def process_bar(
         )
         if stop is not None and bar.close - stop <= 0:
             return
-        if bar.atr is not None and _calc_target(PositionSide.CE, bar.close, bar.atr, cfg) <= bar.close:
+        if _calc_target(PositionSide.CE, bar.close, bar.atr, cfg) <= bar.close:
             return
         position.side = PositionSide.CE
         position.entry_price = bar.close
@@ -349,6 +346,7 @@ def process_bar(
         position.target = target
         position.entry_time = bar.timestamp
         position.entry_bar_index = bar.index
+        day.active_strategy = "v38"
         logger.log(
             timestamp=bar.timestamp,
             event_type="BUY_CE",
@@ -363,18 +361,20 @@ def process_bar(
             or_low=day.or_low,
             adx=bar.adx,
             vwap=bar.vwap,
+            strategy="v38",
         )
         day.trades_today += 1
         day.fired_long_today = True
         day.last_entry_bar_index = bar.index
+        return
 
-    elif buy_pe and bar.atr is not None and day.or_high is not None and day.or_low is not None:
+    if buy_pe and bar.atr is not None and day.or_high is not None and day.or_low is not None:
         stop, target = _calc_stops(
             PositionSide.PE, bar.close, bar.atr, day.or_high, day.or_low, cfg
         )
         if stop is not None and stop - bar.close <= 0:
             return
-        if bar.atr is not None and _calc_target(PositionSide.PE, bar.close, bar.atr, cfg) >= bar.close:
+        if _calc_target(PositionSide.PE, bar.close, bar.atr, cfg) >= bar.close:
             return
         position.side = PositionSide.PE
         position.entry_price = bar.close
@@ -382,6 +382,7 @@ def process_bar(
         position.target = target
         position.entry_time = bar.timestamp
         position.entry_bar_index = bar.index
+        day.active_strategy = "v38"
         logger.log(
             timestamp=bar.timestamp,
             event_type="BUY_PE",
@@ -396,7 +397,33 @@ def process_bar(
             or_low=day.or_low,
             adx=bar.adx,
             vwap=bar.vwap,
+            strategy="v38",
         )
         day.trades_today += 1
         day.fired_short_today = True
         day.last_entry_bar_index = bar.index
+
+
+def process_bar(
+    state: ReplayState,
+    bar: BarContext,
+    logger: ReplayLogger,
+    cfg: StrategyConfig = DEFAULT_CONFIG,
+) -> None:
+    """Process one confirmed bar (v3.8-only legacy path)."""
+    state.bar_index = bar.index
+    day = state.day
+    if day is None:
+        raise RuntimeError("DayState must be initialized before process_bar")
+
+    update_or(day, bar, cfg)
+
+    position = state.position
+    if position.side != PositionSide.FLAT:
+        if _check_exit_on_bar(position, bar, logger, cfg):
+            return
+
+    if _handle_square_off(position, bar, logger):
+        return
+
+    _process_v38_entries(state, bar, logger, cfg)

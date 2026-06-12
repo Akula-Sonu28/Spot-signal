@@ -46,6 +46,15 @@ class DayState:
     fired_long_today: bool = False
     fired_short_today: bool = False
     last_entry_bar_index: int | None = None
+    # v3.9 combined router + J+ trap state
+    day_mode: str | None = None
+    losses_today: int = 0
+    touched_above_or: bool = False
+    touched_below_or: bool = False
+    trap_high: float | None = None
+    trap_low: float | None = None
+    first_trap_side: str | None = None
+    active_strategy: str | None = None
 
 
 @dataclass
