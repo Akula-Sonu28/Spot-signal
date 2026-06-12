@@ -88,7 +88,7 @@ def test_telegram_format_buy_ce_catch_up_note():
         extra={"catch_up": True, "or_high": 23148.05, "or_low": 23072.05, "adx": 51.0, "vwap": 23124.6},
     )
     text = TelegramAlerter.format_signal(event)
-    assert "Catch-up alert" in text
+    assert "CATCH-UP" in text
     assert "BUY_CE" in text
 
 
@@ -107,7 +107,7 @@ def test_telegram_format_buy_ce():
     text = TelegramAlerter.format_signal(event)
     assert "BUY_CE" in text
     assert "23267.25" in text
-    assert "manual execution" in text
+    assert "BUY CALL" in text
 
 
 def test_monitor_window_helpers():

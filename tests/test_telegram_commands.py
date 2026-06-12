@@ -41,10 +41,16 @@ def test_is_authorized():
 
 
 def test_session_process_control_messages(tmp_path: Path, monkeypatch):
+    import sys
+
     lock = tmp_path / "market-session.lock"
-    script = tmp_path / "run.sh"
-    script.write_text("#!/bin/bash\ntrue\n", encoding="utf-8")
-    script.chmod(0o755)
+    if sys.platform == "win32":
+        script = tmp_path / "run.ps1"
+        script.write_text("exit 0\n", encoding="utf-8")
+    else:
+        script = tmp_path / "run.sh"
+        script.write_text("#!/bin/bash\ntrue\n", encoding="utf-8")
+        script.chmod(0o755)
     log = tmp_path / "market-session.log"
     log.write_text("line1\nline2\n", encoding="utf-8")
 
@@ -117,7 +123,7 @@ def test_handler_status_and_tick(tmp_path: Path, monkeypatch):
     handler.force_tick_flag = Path("force_tick.request")
 
     handler._dispatch(ParsedCommand("status", ()))
-    assert sent and "status" in sent[0].lower()
+    assert sent and "nifty signal engine" in sent[0].lower()
 
     sent.clear()
     handler._dispatch(ParsedCommand("tick", ()))

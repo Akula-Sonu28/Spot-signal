@@ -14,7 +14,7 @@ from functools import lru_cache
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from bot.futures_vwap import _encode_key, _http_json
+from bot.futures_vwap import _encode_key, _http_json, _urlopen_ssl
 
 NSE_JSON_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 OptionSide = Literal["CE", "PE"]
@@ -81,7 +81,7 @@ def pick_strike(spot: float, option_type: OptionSide, mode: StrikeMode) -> int:
 @lru_cache(maxsize=1)
 def _load_nifty_options_index() -> list[dict]:
     req = urllib.request.Request(NSE_JSON_URL, headers={"User-Agent": "nifty-spot-signal-engine/0.1"})
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with _urlopen_ssl(req, timeout=120) as resp:
         raw = gzip.decompress(resp.read())
     data = json.loads(raw)
     out = []

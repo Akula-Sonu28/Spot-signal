@@ -25,6 +25,9 @@ def session_start_command(script: Path) -> list[str]:
         return [
             "powershell.exe",
             "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
             "-ExecutionPolicy",
             "Bypass",
             "-File",

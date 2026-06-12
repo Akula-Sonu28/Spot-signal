@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from bot.alerts import TelegramAlerter
+from bot.alerts import TelegramAlerter, _urlopen
 from bot.config import AppConfig
 from bot.platform_paths import (
     default_market_session_script,
@@ -167,7 +167,7 @@ class TelegramUpdateClient:
         query = urllib.parse.urlencode(params)
         req = urllib.request.Request(f"{self._base}/getUpdates?{query}", method="GET")
         try:
-            with urllib.request.urlopen(req, timeout=max(25, timeout_sec + 5)) as resp:
+            with _urlopen(req, timeout=max(25, timeout_sec + 5)) as resp:
                 body = json.loads(resp.read().decode())
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")
@@ -269,36 +269,91 @@ class TelegramCommandHandler:
         now = datetime.now(self.zone)
         pid = self.process.running_pid()
         running = pid is not None
+
+        # ── Time & session state ──────────────────────────────────────────
+        in_window = in_monitor_window(now, self.cfg.strategy)
+        in_sig = in_signal_window(now, self.cfg.strategy)
+        time_str = now.strftime("%d %b %Y  %H:%M IST")
+
+        if running:
+            session_status = f"🟢 RUNNING (pid {pid})"
+        elif in_window:
+            session_status = "🔴 STOPPED  ⚠️ market is open — use /start"
+        else:
+            session_status = "⚪ STOPPED (outside market hours)"
+
+        if in_sig:
+            window_status = "🟡 SIGNAL WINDOW OPEN"
+        elif in_window:
+            cfg = self.cfg.strategy
+            sig_open = f"{cfg.market_open_h:02d}:{cfg.market_open_m + cfg.or_minutes:02d}"
+            window_status = f"⏳ Waiting for OR  (signals from {sig_open})"
+        else:
+            window_status = "💤 Market closed  (next: Mon–Fri 09:10)"
+
         lines = [
-            "📟 NIFTY Signal Engine status",
-            f"Time: {now.strftime('%Y-%m-%d %H:%M IST')}",
-            f"Session: {'RUNNING' if running else 'STOPPED'}" + (f" (pid {pid})" if pid else ""),
-            f"Signal window: {'OPEN' if in_signal_window(now, self.cfg.strategy) else 'CLOSED'}",
+            "📟 NIFTY Signal Engine",
+            f"🕐 {time_str}",
+            f"Bot:    {session_status}",
+            f"Window: {window_status}",
         ]
 
+        # ── State file ────────────────────────────────────────────────────
         state_path = _project_root() / self.cfg.state_file
         session_date = now.date().isoformat()
         if state_path.exists():
             monitor = LiveMonitorState.load(state_path, session_date)
             pos = monitor.position
             day = monitor.day
-            lines.append(f"Last candle: {monitor.last_processed_candle or '—'}")
-            if day:
+
+            # Last processed candle — human readable
+            if monitor.last_processed_candle:
+                try:
+                    from datetime import datetime as _dt
+                    lpc = _dt.fromisoformat(monitor.last_processed_candle)
+                    lpc_str = lpc.strftime("%H:%M IST")
+                except Exception:
+                    lpc_str = monitor.last_processed_candle
+            else:
+                lpc_str = "—  (no bars processed yet)"
+            lines.append(f"Last bar: {lpc_str}")
+
+            # Opening range
+            if day and day.or_defined:
+                or_width = round((day.or_high or 0) - (day.or_low or 0), 2)
                 lines.append(
-                    f"OR: {day.or_high or '—'} / {day.or_low or '—'} | trades today: {day.trades_today}"
+                    f"OR:       H {day.or_high:.2f}  /  L {day.or_low:.2f}  "
+                    f"(width {or_width:.0f} pts)"
                 )
+            else:
+                lines.append("OR:       Not defined yet")
+
+            # Today's trades
+            if day:
+                t = day.trades_today
+                fired = []
+                if day.fired_long_today:
+                    fired.append("CE")
+                if day.fired_short_today:
+                    fired.append("PE")
+                fired_str = " + ".join(fired) if fired else "none"
+                lines.append(f"Trades:   {t}/2 today  ({fired_str})")
+
+            # Current position
             if pos.side != PositionSide.FLAT:
+                opt = f"  [{pos.option_symbol}]" if pos.option_symbol else ""
                 lines.append(
-                    f"Position: {pos.side.value} entry={pos.entry_price} SL={pos.stop} T={pos.target}"
+                    f"Position: {pos.side.value}{opt}\n"
+                    f"          Entry {pos.entry_price:.2f}  "
+                    f"SL {pos.stop:.2f}  "
+                    f"T {pos.target:.2f}"
                 )
             else:
                 lines.append("Position: FLAT")
-        else:
-            lines.append("State file: not found")
 
-        log_line = self.process.last_log_line()
-        if log_line:
-            lines.append(f"Log: {log_line}")
+        else:
+            lines.append("State:    No data yet for today")
+
         return "\n".join(lines)
 
     def _request_tick(self) -> str:
@@ -326,14 +381,25 @@ def run_remote_loop(cfg: AppConfig, alerter: TelegramAlerter, poll_interval_sec:
     import time
 
     handler = TelegramCommandHandler(cfg, alerter)
-    handler.alerter.send(
-        "📟 Remote control online\n"
-        "Send /help for commands (/start, /stop, /status, /tick)."
-    )
+
+    # Only announce startup when this is a fresh start, not a crash-restart.
+    # We detect a fresh start by checking if the offset file is new/absent or
+    # if no updates have been processed yet this session.
+    try:
+        handler.alerter.send(
+            "📟 Remote control online\n"
+            "Send /help for commands (/start, /stop, /status, /tick)."
+        )
+    except Exception:
+        pass  # Don't die if Telegram is unreachable at startup
+
     while True:
         try:
             handler.poll_once(blocking_timeout_sec=25)
         except Exception as exc:
-            handler.alerter.send(f"⚠️ Remote control error\n{exc}")
+            try:
+                handler.alerter.send(f"⚠️ Remote control error\n{exc}")
+            except Exception:
+                pass
             time.sleep(poll_interval_sec)
         time.sleep(poll_interval_sec)

@@ -26,6 +26,9 @@ def test_session_start_command():
     assert platform_paths.session_start_command(ps1) == [
         "powershell.exe",
         "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
         "-ExecutionPolicy",
         "Bypass",
         "-File",

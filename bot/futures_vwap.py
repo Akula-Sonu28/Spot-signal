@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import ssl
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -14,6 +15,21 @@ if TYPE_CHECKING:
 from zoneinfo import ZoneInfo
 
 from bot.indicators import session_vwap_series
+
+
+def _no_verify_ctx() -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _urlopen_ssl(req: urllib.request.Request, timeout: int = 60):  # type: ignore[return]
+    """urlopen that falls back to unverified SSL for corporate proxy environments."""
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except ssl.SSLCertVerificationError:
+        return urllib.request.urlopen(req, timeout=timeout, context=_no_verify_ctx())
 
 INDEX_INSTRUMENT = "NSE_INDEX|Nifty 50"
 NSE_JSON_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
@@ -46,7 +62,7 @@ def _http_json(url: str, token: str | None = None) -> dict:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with _urlopen_ssl(req, timeout=60) as resp:
         return json.load(resp)
 
 
@@ -54,7 +70,7 @@ def nearest_nifty_future_key(as_of: date | None = None) -> str:
     """Return instrument_key for nearest NIFTY index future (not BankNifty/Finnifty)."""
     as_of = as_of or date.today()
     req = urllib.request.Request(NSE_JSON_URL, headers={"User-Agent": "nifty-spot-signal-engine/0.1"})
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with _urlopen_ssl(req, timeout=120) as resp:
         raw = gzip.decompress(resp.read())
     instruments = json.loads(raw)
 

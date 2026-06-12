@@ -7,7 +7,7 @@ Set-Location $Root
 $LogDir = Join-Path $Root "data\live"
 $Log = Join-Path $LogDir "market-session.log"
 $Lock = Join-Path $LogDir "market-session.lock"
-$Python = if ($env:NIFTY_PYTHON) { $env:NIFTY_PYTHON } else { "python" }
+$Python = if ($env:NIFTY_PYTHON) { $env:NIFTY_PYTHON } else { if (Get-Command "py" -ErrorAction SilentlyContinue) { "py" } else { "python" } }
 
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
@@ -52,4 +52,26 @@ finally {
     [void][WinPower]::SetThreadExecutionState([WinPower]::ES_CONTINUOUS)
     Remove-Item $Lock -Force -ErrorAction SilentlyContinue
     Write-Log "END"
+
+    # Safety-net stop message in case Python exited without sending one
+    # (e.g. hard kill, PC restart). Only fires if BOT_STOPPED wasn't logged.
+    # Best-effort — ignore failures.
+    try {
+        $signals = Join-Path $Root "data\live\signals.csv"
+        $alreadySent = $false
+        if (Test-Path $signals) {
+            $lastLines = Get-Content $signals -Tail 5 -ErrorAction SilentlyContinue
+            if ($lastLines -match "BOT_STOPPED") { $alreadySent = $true }
+        }
+        if (-not $alreadySent) {
+            & $Python -c "
+from bot.config import load_app_config
+from bot.alerts import TelegramAlerter
+import os
+os.chdir(r'$Root')
+cfg = load_app_config('.env')
+TelegramAlerter(cfg).bot_stopped('session ended unexpectedly')
+" 2>$null
+        }
+    } catch { }
 }
