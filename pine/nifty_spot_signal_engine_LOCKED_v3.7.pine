@@ -1,18 +1,12 @@
 //@version=6
 // =============================================================================
-// NIFTY SPOT SIGNAL ENGINE v3.7 — ORB + VWAP + ADX (Profitable)
+// NIFTY SPOT SIGNAL ENGINE v3.7 — ORB + VWAP + ADX
 // =============================================================================
-// Best configuration from iterative testing (PF 1.28, +₹1,082, 50% WR):
-//   - 15-min Opening Range
-//   - OR Range stop (structural)
-//   - Max OR width 100 pts (caps outsized losses)
-//   - VWAP alignment (breakout must be on correct side)
-//   - ADX ≥ 18 (only trade when trending, skip chop)
-//   - Volume ≥ average (confirms breakout participation)
-//   - RR 2.0 (asymmetric winners)
-//   - Trail-to-breakeven at 1R
-//   - Skip Tuesday (weakest day per 8-year research)
-//   - 1 trade/day max
+// Entries: 15-min OR, width 25–100, VWAP, ADX, max 2 trades/day
+// Exits (sweep winner, matches bot/strategy.py):
+//   - OR Range stop + 10pt buffer
+//   - Close-only SL (ignore wicks)
+//   - Decoupled target: ATR × 1.2 × RR 2.0
 //   - Both directions (market-agnostic)
 // =============================================================================
 
@@ -65,10 +59,13 @@ bool skipTuesday     = input.bool(false, "Skip Tuesday (weakest ORB day)", group
 //=============================================================================
 // 3. STOP & TARGET (simple: SL + Target + EOD only)
 //=============================================================================
-string slMode        = input.string("ATR", "Stop-loss mode", options = ["ATR", "OR Range", "Tighter of ATR/OR"], group = grpRisk)
-float atrSlMult      = input.float(1.2, "ATR stop multiplier", minval = 0.5, maxval = 5.0, step = 0.1, group = grpRisk)
+string slMode        = input.string("OR Range", "Stop-loss mode", options = ["ATR", "OR Range", "Tighter of ATR/OR"], group = grpRisk)
+bool closeOnlySl     = input.bool(true, "Close-only SL (ignore wicks)", group = grpRisk)
+float slBufferPts    = input.float(10.0, "SL buffer beyond OR (points)", minval = 0, step = 5, group = grpRisk)
+float atrSlMult      = input.float(1.4, "ATR stop multiplier", minval = 0.5, maxval = 5.0, step = 0.1, group = grpRisk)
 int atrLen           = input.int(14, "ATR length", minval = 5, group = grpRisk)
-float rrRatio        = input.float(1.8, "Risk-Reward ratio (target = RR x risk)", minval = 0.5, maxval = 5.0, step = 0.1, group = grpRisk)
+float atrTargetMult  = input.float(1.2, "ATR target multiplier (decoupled)", minval = 0.5, maxval = 3.0, step = 0.1, group = grpRisk)
+float rrRatio        = input.float(2.0, "RR ratio (decoupled target)", minval = 0.5, maxval = 5.0, step = 0.1, group = grpRisk)
 
 //=============================================================================
 // 4. SESSION CONTROLS
@@ -252,8 +249,8 @@ bool buyPeSignal = shortBreak and canTrade and noDup and not firedShortToday and
 float atrStop = atrVal * atrSlMult
 float longStopATR = close - atrStop
 float shortStopATR = close + atrStop
-float longStopOR = orLow
-float shortStopOR = orHigh
+float longStopOR = orLow - slBufferPts
+float shortStopOR = orHigh + slBufferPts
 
 float longStopCalc = switch slMode
     "ATR" => longStopATR
@@ -267,17 +264,29 @@ float shortStopCalc = switch slMode
 
 float longRisk = close - longStopCalc
 float shortRisk = shortStopCalc - close
-float longTargetCalc = close + longRisk * rrRatio
-float shortTargetCalc = close - shortRisk * rrRatio
+float longTargetCalc = close + atrVal * atrTargetMult * rrRatio
+float shortTargetCalc = close - atrVal * atrTargetMult * rrRatio
 
 //=============================================================================
-// STRATEGY EXIT ORDERS (simple: fixed SL + fixed Target, no trailing)
+// STRATEGY EXIT ORDERS — wick SL or close-only SL + target
 //=============================================================================
-if strategy.position_size > 0 and not na(activeStop) and not na(activeTarget)
+if not closeOnlySl and strategy.position_size > 0 and not na(activeStop) and not na(activeTarget)
     strategy.exit("CE_EXIT", from_entry = "BUY_CE", stop = activeStop, limit = activeTarget, comment_profit = "TARGET CE", comment_loss = "SL CE", disable_alert = true)
 
-if strategy.position_size < 0 and not na(activeStop) and not na(activeTarget)
+if not closeOnlySl and strategy.position_size < 0 and not na(activeStop) and not na(activeTarget)
     strategy.exit("PE_EXIT", from_entry = "BUY_PE", stop = activeStop, limit = activeTarget, comment_profit = "TARGET PE", comment_loss = "SL PE", disable_alert = true)
+
+if closeOnlySl and strategy.position_size > 0 and not na(activeTarget)
+    strategy.exit("CE_TGT", from_entry = "BUY_CE", limit = activeTarget, comment_profit = "TARGET CE", disable_alert = true)
+
+if closeOnlySl and strategy.position_size < 0 and not na(activeTarget)
+    strategy.exit("PE_TGT", from_entry = "BUY_PE", limit = activeTarget, comment_profit = "TARGET PE", disable_alert = true)
+
+if closeOnlySl and barstate.isconfirmed and strategy.position_size > 0 and not na(activeStop) and close <= activeStop
+    strategy.close("BUY_CE", comment = "SL CE close")
+
+if closeOnlySl and barstate.isconfirmed and strategy.position_size < 0 and not na(activeStop) and close >= activeStop
+    strategy.close("BUY_PE", comment = "SL PE close")
 
 //=============================================================================
 // SQUARE-OFF
@@ -329,9 +338,9 @@ float prevStop = activeStop[1]
 float prevTarget = activeTarget[1]
 float prevEntry = activeEntry[1]
 
-bool ceSlHit = barstate.isconfirmed and ceWasOpen and not na(prevStop) and low <= prevStop
+bool ceSlHit = barstate.isconfirmed and ceWasOpen and not na(prevStop) and (closeOnlySl ? close <= prevStop : low <= prevStop)
 bool ceTgtHit = barstate.isconfirmed and ceWasOpen and not ceSlHit and not na(prevTarget) and high >= prevTarget
-bool peSlHit = barstate.isconfirmed and peWasOpen and not na(prevStop) and high >= prevStop
+bool peSlHit = barstate.isconfirmed and peWasOpen and not na(prevStop) and (closeOnlySl ? close >= prevStop : high >= prevStop)
 bool peTgtHit = barstate.isconfirmed and peWasOpen and not peSlHit and not na(prevTarget) and low <= prevTarget
 
 if ceSlHit

@@ -1,0 +1,24 @@
+{
+  "sessions": 51,
+  "days_with_trades": 18,
+  "days_no_breakout": 0,
+  "days_or_width_fail_all_day": 32,
+  "trades_per_day_dist": {
+    "0": 33,
+    "1": 14,
+    "2": 4
+  },
+  "filter_totals": {
+    "raw_short_breakout": 1008,
+    "blocked_or_wide": 1355,
+    "raw_long_breakout": 1232,
+    "blocked_adx": 327,
+    "would_enter_pe": 12,
+    "blocked_in_position": 324,
+    "blocked_already_fired_pe": 90,
+    "blocked_vwap": 69,
+    "would_enter_ce": 10,
+    "blocked_already_fired_ce": 53
+  },
+  "missed_days": 33
+}

@@ -1,0 +1,242 @@
+//@version=6
+// =============================================================================
+// NIFTY EXIT RESEARCH v2 — continuous exit params (matches bot/sweep_exits.py)
+// =============================================================================
+// v1 A–K presets never combined OR stop + close-only SL. Python grid sweep on
+// 51 sessions found the winner: OR_RANGE stop, close-only SL, RR 2.0, 10pt buffer.
+// Defaults below mirror that config. Tune sliders; compare in Strategy Tester.
+// =============================================================================
+
+strategy(
+     "NIFTY Exit Research v2",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 100000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 100,
+     commission_type = strategy.commission.cash_per_order,
+     commission_value = 40,
+     slippage = 2,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     max_bars_back = 500,
+     currency = currency.INR
+)
+
+const string grpORB     = "1. Opening Range"
+const string grpFilter  = "2. Breakout Filters"
+const string grpExit    = "3. Exit Parameters (tune here)"
+const string grpSession = "4. Session"
+const string grpVisual  = "5. Visuals"
+
+// --- OR (locked v3.7 / bot) ---
+int orMinutes        = input.int(15, "OR duration (min)", minval = 5, maxval = 60, step = 5, group = grpORB)
+float minOrRange     = input.float(25.0, "Min OR range (pts)", minval = 0, step = 5, group = grpORB)
+float maxOrRange     = input.float(100.0, "Max OR range (pts)", minval = 50, step = 10, group = grpORB)
+
+// --- Filters (bot defaults) ---
+bool useVwapFilter   = input.bool(true, "VWAP filter", group = grpFilter)
+bool useAdxFilter    = input.bool(true, "ADX filter", group = grpFilter)
+int adxFilterLen     = input.int(14, "ADX length", minval = 5, group = grpFilter)
+float adxMinThresh   = input.float(18.0, "Min ADX", minval = 10, step = 1, group = grpFilter)
+
+// --- Exit (sweep winner defaults) ---
+string slMode        = input.string("OR_RANGE", "Stop mode", options = ["ATR", "OR_RANGE", "WIDER"], group = grpExit,
+     tooltip = "ATR=tight ATR stop | OR_RANGE=OR low/high | WIDER=farthest of ATR/OR")
+bool closeOnlySl     = input.bool(true, "Close-only SL (ignore wicks)", group = grpExit)
+int atrLen           = input.int(14, "ATR length", minval = 5, group = grpExit)
+float atrSlMult      = input.float(1.4, "ATR SL multiplier", minval = 0.5, maxval = 5.0, step = 0.1, group = grpExit)
+float slBufferPts    = input.float(10.0, "SL buffer (pts)", minval = 0, step = 5, group = grpExit)
+int slDelayBars      = input.int(0, "SL delay (bars after entry)", minval = 0, maxval = 5, group = grpExit)
+string targetMode    = input.string("DECOUPLED", "Target mode", options = ["DECOUPLED", "RISK_RR"], group = grpExit,
+     tooltip = "DECOUPLED=ATR×mult×RR (bot live) | RISK_RR=risk distance × RR")
+float atrTargetMult  = input.float(1.2, "ATR target mult (decoupled)", minval = 0.5, maxval = 3.0, step = 0.1, group = grpExit)
+float rrRatio        = input.float(2.0, "RR ratio", minval = 0.5, maxval = 5.0, step = 0.1, group = grpExit)
+
+// --- Session ---
+string tzInput       = input.string("Asia/Kolkata", "Timezone", group = grpSession)
+int squareOffH       = input.int(15, "Square-off hour", minval = 13, maxval = 15, group = grpSession)
+int squareOffM       = input.int(15, "Square-off minute", minval = 0, maxval = 59, group = grpSession)
+int maxTradesDay     = input.int(2, "Max trades/day", minval = 1, maxval = 5, group = grpSession)
+
+// --- Visuals ---
+bool showOrLines     = input.bool(true, "Show OR lines", group = grpVisual)
+bool showLevels      = input.bool(true, "Show SL/Target", group = grpVisual)
+bool showDash        = input.bool(true, "Dashboard", group = grpVisual)
+bool showMarkers     = input.bool(true, "Entry/exit markers", group = grpVisual)
+
+float vwapVal = ta.vwap(hlc3)
+float atrVal = ta.atr(atrLen)
+[_, _, adxVal] = ta.dmi(adxFilterLen, adxFilterLen)
+bool adxOk = not useAdxFilter or adxVal >= adxMinThresh
+
+f_calcLongStop(float entry, float atrDist, float orLow) =>
+    float atrSl = entry - atrDist - slBufferPts
+    float orSl = orLow - slBufferPts
+    slMode == "ATR" ? atrSl : slMode == "OR_RANGE" ? orSl : math.min(atrSl, orSl)
+
+f_calcShortStop(float entry, float atrDist, float orHigh) =>
+    float atrSl = entry + atrDist + slBufferPts
+    float orSl = orHigh + slBufferPts
+    slMode == "ATR" ? atrSl : slMode == "OR_RANGE" ? orSl : math.max(atrSl, orSl)
+
+f_calcLongTarget(float entry, float stop, float atr) =>
+    targetMode == "DECOUPLED" ? entry + atr * atrTargetMult * rrRatio : entry + (entry - stop) * rrRatio
+
+f_calcShortTarget(float entry, float stop, float atr) =>
+    targetMode == "DECOUPLED" ? entry - atr * atrTargetMult * rrRatio : entry - (stop - entry) * rrRatio
+
+f_exitLabel() =>
+    slMode + (closeOnlySl ? " closeSL" : " wickSL") + " RR" + str.tostring(rrRatio, "#.#")
+
+int barMin = hour(time_close, tzInput) * 60 + minute(time_close, tzInput)
+int marketOpen = 9 * 60 + 15
+int orEndMin = marketOpen + orMinutes
+int sqOffMin = squareOffH * 60 + squareOffM
+
+bool isInOR = barMin >= marketOpen and barMin < orEndMin
+bool isAfterOR = barMin >= orEndMin
+bool isSquareOff = barMin >= sqOffMin
+bool isEntryWindow = isAfterOR and not isSquareOff
+
+var float orHigh = na
+var float orLow = na
+var bool orDefined = false
+bool isDayChange = ta.change(time("D")) != 0
+
+if isDayChange
+    orHigh := na
+    orLow := na
+    orDefined := false
+
+if isInOR
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow := na(orLow) ? low : math.min(orLow, low)
+
+if isAfterOR and not na(orHigh) and not na(orLow)
+    orDefined := true
+
+float orRange = orDefined ? orHigh - orLow : na
+bool orWidthOk = orDefined and not na(orRange) and orRange >= minOrRange and orRange <= maxOrRange
+
+var int tradesToday = 0
+var bool firedLongToday = false
+var bool firedShortToday = false
+
+if isDayChange
+    tradesToday := 0
+    firedLongToday := false
+    firedShortToday := false
+
+var float activeEntry = na
+var float activeStop = na
+var float activeTarget = na
+var string lastExitReason = "—"
+var int lastEntryBar = na
+var int entryBarIdx = na
+
+bool isFlat = strategy.position_size == 0
+
+if strategy.position_size == 0 and nz(strategy.position_size[1]) != 0
+    activeEntry := na
+    activeStop := na
+    activeTarget := na
+    entryBarIdx := na
+
+bool longBreak = barstate.isconfirmed and orDefined and isAfterOR and close > orHigh and (not useVwapFilter or close > vwapVal) and adxOk and orWidthOk
+bool shortBreak = barstate.isconfirmed and orDefined and isAfterOR and close < orLow and (not useVwapFilter or close < vwapVal) and adxOk and orWidthOk
+
+bool canTrade = isEntryWindow and tradesToday < maxTradesDay
+bool noDup = na(lastEntryBar) or bar_index > lastEntryBar
+
+bool buyCeSignal = longBreak and canTrade and noDup and not firedLongToday and isFlat
+bool buyPeSignal = shortBreak and canTrade and noDup and not firedShortToday and isFlat
+
+// Wick-based SL/target via strategy.exit
+if not closeOnlySl and strategy.position_size > 0 and not na(activeStop) and not na(activeTarget)
+    strategy.exit("CE_EXIT", from_entry = "BUY_CE", stop = activeStop, limit = activeTarget, comment_profit = "TG", comment_loss = "SL", disable_alert = true)
+
+if not closeOnlySl and strategy.position_size < 0 and not na(activeStop) and not na(activeTarget)
+    strategy.exit("PE_EXIT", from_entry = "BUY_PE", stop = activeStop, limit = activeTarget, comment_profit = "TG", comment_loss = "SL", disable_alert = true)
+
+// Close-only: target on wick, SL on bar close after delay
+if closeOnlySl and strategy.position_size > 0 and not na(activeTarget)
+    strategy.exit("CE_TGT", from_entry = "BUY_CE", limit = activeTarget, comment_profit = "TG", disable_alert = true)
+
+if closeOnlySl and strategy.position_size < 0 and not na(activeTarget)
+    strategy.exit("PE_TGT", from_entry = "BUY_PE", limit = activeTarget, comment_profit = "TG", disable_alert = true)
+
+bool slDelayOk = not na(entryBarIdx) and bar_index - entryBarIdx >= slDelayBars
+
+if closeOnlySl and barstate.isconfirmed and slDelayOk and strategy.position_size > 0 and not na(activeStop) and close <= activeStop
+    strategy.close("BUY_CE", comment = "SL close")
+    lastExitReason := "SL_CLOSE"
+
+if closeOnlySl and barstate.isconfirmed and slDelayOk and strategy.position_size < 0 and not na(activeStop) and close >= activeStop
+    strategy.close("BUY_PE", comment = "SL close")
+    lastExitReason := "SL_CLOSE"
+
+if barstate.isconfirmed and isSquareOff and strategy.position_size != 0
+    strategy.close_all(comment = "SQ OFF")
+    lastExitReason := "EOD"
+
+float atrDist = atrVal * atrSlMult
+
+if buyCeSignal and not na(orLow)
+    float sl = f_calcLongStop(close, atrDist, orLow)
+    float tg = f_calcLongTarget(close, sl, atrVal)
+    if close > sl and tg > close
+        activeEntry := close
+        activeStop := sl
+        activeTarget := tg
+        entryBarIdx := bar_index
+        lastExitReason := "—"
+        strategy.entry("BUY_CE", strategy.long, comment = "CE", disable_alert = true)
+        tradesToday += 1
+        firedLongToday := true
+        lastEntryBar := bar_index
+
+if buyPeSignal and not na(orHigh)
+    float sl = f_calcShortStop(close, atrDist, orHigh)
+    float tg = f_calcShortTarget(close, sl, atrVal)
+    if sl > close and tg < close
+        activeEntry := close
+        activeStop := sl
+        activeTarget := tg
+        entryBarIdx := bar_index
+        lastExitReason := "—"
+        strategy.entry("BUY_PE", strategy.short, comment = "PE", disable_alert = true)
+        tradesToday += 1
+        firedShortToday := true
+        lastEntryBar := bar_index
+
+plot(showOrLines and orDefined ? orHigh : na, "OR High", color = color.new(color.green, 20), linewidth = 2, style = plot.style_linebr)
+plot(showOrLines and orDefined ? orLow : na, "OR Low", color = color.new(color.red, 20), linewidth = 2, style = plot.style_linebr)
+plot(vwapVal, "VWAP", color = color.new(color.blue, 30))
+plot(showLevels and strategy.position_size != 0 ? activeStop : na, "SL", color = color.red, style = plot.style_linebr, linewidth = 2)
+plot(showLevels and strategy.position_size != 0 ? activeTarget : na, "Target", color = color.green, style = plot.style_linebr, linewidth = 2)
+bgcolor(isInOR ? color.new(color.yellow, 92) : na)
+
+plotshape(showMarkers and buyCeSignal, "CE", shape.labelup, location.belowbar, color.green, text = "CE", textcolor = color.white, size = size.small)
+plotshape(showMarkers and buyPeSignal, "PE", shape.labeldown, location.abovebar, color.red, text = "PE", textcolor = color.white, size = size.small)
+
+var table dash = table.new(position.top_right, 2, 9, border_width = 1)
+
+if barstate.islast and showDash
+    table.cell(dash, 0, 0, "Exit", bgcolor = color.new(color.black, 5), text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 0, f_exitLabel(), bgcolor = color.new(color.blue, 10), text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 1, "Position", bgcolor = color.new(color.black, 5), text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 1, strategy.position_size > 0 ? "CE" : strategy.position_size < 0 ? "PE" : "Flat", bgcolor = color.new(color.gray, 30), text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 2, "Last exit", bgcolor = color.new(color.black, 5), text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 2, lastExitReason, bgcolor = color.new(color.gray, 30), text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 3, "OR width", bgcolor = color.new(color.black, 5), text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 3, orDefined ? str.tostring(orRange, "#") : "—", bgcolor = color.new(color.gray, 30), text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 4, "Trades", bgcolor = color.new(color.black, 5), text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 4, str.tostring(tradesToday), bgcolor = color.new(color.gray, 30), text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 5, "Net P&L", bgcolor = color.new(color.black, 5), text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 5, str.tostring(strategy.netprofit, "#.##"), bgcolor = strategy.netprofit >= 0 ? color.new(color.green, 0) : color.new(color.red, 0), text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 6, "Hint", bgcolor = color.new(color.black, 5), text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 6, "v2 = OR + close SL", bgcolor = color.new(color.gray, 50), text_color = color.white, text_size = size.small)
+
+alertcondition(buyCeSignal, "BUY CE", "Exit v2: BUY CE")
+alertcondition(buyPeSignal, "BUY PE", "Exit v2: BUY PE")

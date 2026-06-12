@@ -61,14 +61,25 @@ def test_or_width_blocks_narrow_range():
 
 
 def test_calc_stops_atr_mode():
-    cfg = StrategyConfig(atr_sl_mult=1.2, atr_target_mult=1.2, rr_ratio=1.8)
+    cfg = StrategyConfig(
+        sl_mode="ATR", atr_sl_mult=1.2, atr_target_mult=1.2, rr_ratio=1.8, sl_buffer_pts=0.0
+    )
     stop, target = _calc_stops(PositionSide.CE, 100.0, 10.0, 95.0, 90.0, cfg)
     assert stop == pytest.approx(88.0)  # 100 - 1.2*10
     assert target == pytest.approx(121.6)  # 100 + 10*1.2*1.8
 
 
+def test_calc_stops_or_range_with_buffer():
+    cfg = StrategyConfig(sl_mode="OR_RANGE", sl_buffer_pts=10.0)
+    stop, target = _calc_stops(PositionSide.CE, 100.0, 10.0, 95.0, 90.0, cfg)
+    assert stop == pytest.approx(80.0)  # or_low 90 - 10 buffer
+    assert target == pytest.approx(124.0)  # 100 + 10*1.2*2.0
+
+
 def test_calc_stops_decoupled_sl_wider_than_target_base():
-    cfg = StrategyConfig(atr_sl_mult=1.5, atr_target_mult=1.2, rr_ratio=1.8)
+    cfg = StrategyConfig(
+        sl_mode="ATR", atr_sl_mult=1.5, atr_target_mult=1.2, rr_ratio=1.8, sl_buffer_pts=0.0
+    )
     stop, target = _calc_stops(PositionSide.CE, 100.0, 10.0, 95.0, 90.0, cfg)
     assert stop == pytest.approx(85.0)
     assert target == pytest.approx(121.6)
@@ -135,8 +146,8 @@ def test_square_off_closes_position():
     assert state.position.side == PositionSide.FLAT
 
 
-def test_sl_priority_over_target_same_bar():
-    cfg = StrategyConfig()
+def test_sl_priority_over_target_same_bar_wick_mode():
+    cfg = StrategyConfig(close_only_sl=False)
     day = make_day_state("2025-01-07")
     day.or_defined = True
     pos = Position(
@@ -144,6 +155,7 @@ def test_sl_priority_over_target_same_bar():
         entry_price=100,
         stop=95,
         target=110,
+        entry_bar_index=5,
     )
     logger = ReplayLogger()
     state = ReplayState(day=day, position=pos)
@@ -151,3 +163,40 @@ def test_sl_priority_over_target_same_bar():
     process_bar(state, bar, logger, cfg)
     assert logger.filter("SL_CE")
     assert not logger.filter("TARGET_CE")
+
+
+def test_close_only_sl_ignores_wick():
+    cfg = StrategyConfig(close_only_sl=True)
+    day = make_day_state("2025-01-07")
+    day.or_defined = True
+    pos = Position(
+        side=PositionSide.CE,
+        entry_price=100,
+        stop=95,
+        target=110,
+        entry_bar_index=5,
+    )
+    logger = ReplayLogger()
+    state = ReplayState(day=day, position=pos)
+    bar = _bar(10, 10, 30, 100, 104, 94, 105)  # wick through SL, close above, no target
+    process_bar(state, bar, logger, cfg)
+    assert not logger.filter("SL_CE")
+    assert state.position.side == PositionSide.CE
+
+
+def test_close_only_sl_exits_on_close_through_stop():
+    cfg = StrategyConfig(close_only_sl=True)
+    day = make_day_state("2025-01-07")
+    day.or_defined = True
+    pos = Position(
+        side=PositionSide.CE,
+        entry_price=100,
+        stop=95,
+        target=110,
+        entry_bar_index=5,
+    )
+    logger = ReplayLogger()
+    state = ReplayState(day=day, position=pos)
+    bar = _bar(10, 10, 30, 96, 98, 94, 94)  # close at/below stop
+    process_bar(state, bar, logger, cfg)
+    assert logger.filter("SL_CE")

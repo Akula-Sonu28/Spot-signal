@@ -1,0 +1,189 @@
+//@version=6
+// =============================================================================
+// NIFTY ENTRY RESEARCH v2 — tune entry filters; exit locked to sweep winner
+// =============================================================================
+// Funnel on 51 sessions: 32/51 days skipped (OR > 100pts). Only 19 tradeable OR
+// days → ~25 trades. Loosen max OR above 115 adds junk trades. Try max OR 105–110.
+// Exit locked: OR_RANGE stop, close-only SL, RR 2.0, 10pt buffer (exit v2 winner).
+// =============================================================================
+
+strategy(
+     "NIFTY Entry Research v2",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 100000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 100,
+     commission_type = strategy.commission.cash_per_order,
+     commission_value = 40,
+     slippage = 2,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     max_bars_back = 500,
+     currency = currency.INR
+)
+
+const string grpORB     = "1. Opening Range (main trade limiter)"
+const string grpFilter  = "2. Entry Filters"
+const string grpExit    = "3. Exit (locked — sweep winner)"
+const string grpSession = "4. Session"
+const string grpVisual  = "5. Visuals"
+
+int orMinutes        = input.int(15, "OR duration (min)", minval = 5, maxval = 60, step = 5, group = grpORB)
+float minOrRange     = input.float(25.0, "Min OR range (pts)", minval = 10, step = 5, group = grpORB,
+     tooltip = "Below this = choppy/narrow day, skip")
+float maxOrRange     = input.float(100.0, "Max OR range (pts)", minval = 50, step = 5, group = grpORB,
+     tooltip = "Above this = gap/volatile day. 63% of days blocked at 100. Try 105–110 carefully.")
+
+bool useVwapFilter   = input.bool(true, "VWAP alignment", group = grpFilter)
+bool useAdxFilter    = input.bool(true, "ADX filter", group = grpFilter)
+int adxFilterLen     = input.int(14, "ADX length", minval = 5, group = grpFilter)
+float adxMinThresh   = input.float(18.0, "Min ADX", minval = 10, step = 1, group = grpFilter,
+     tooltip = "Rarely binding on 51d sample — OR width is the main gate")
+int maxTradesDay     = input.int(2, "Max trades/day", minval = 1, maxval = 5, group = grpFilter)
+
+// Locked exit (do not tune here — use nifty_exit_research_v2.pine for exits)
+bool closeOnlySl     = input.bool(true, "Close-only SL", group = grpExit, tooltip = "Locked ON")
+float slBufferPts    = input.float(10.0, "SL buffer (pts)", group = grpExit)
+float atrSlMult      = input.float(1.4, "ATR SL mult (unused for OR stop)", group = grpExit)
+float atrTargetMult  = input.float(1.2, "ATR target mult", group = grpExit)
+float rrRatio        = input.float(2.0, "RR ratio", group = grpExit)
+int atrLen           = input.int(14, "ATR length", group = grpExit)
+
+string tzInput       = input.string("Asia/Kolkata", "Timezone", group = grpSession)
+int squareOffH       = input.int(15, "Square-off hour", group = grpSession)
+int squareOffM       = input.int(15, "Square-off minute", group = grpSession)
+
+bool showOrLines     = input.bool(true, "Show OR lines", group = grpVisual)
+bool showDash        = input.bool(true, "Dashboard", group = grpVisual)
+
+float vwapVal = ta.vwap(hlc3)
+float atrVal = ta.atr(atrLen)
+[_, _, adxVal] = ta.dmi(adxFilterLen, adxFilterLen)
+bool adxOk = not useAdxFilter or adxVal >= adxMinThresh
+
+f_longStop(float entry, float orLow) => orLow - slBufferPts
+f_shortStop(float entry, float orHigh) => orHigh + slBufferPts
+f_longTarget(float entry, float atr) => entry + atr * atrTargetMult * rrRatio
+f_shortTarget(float entry, float atr) => entry - atr * atrTargetMult * rrRatio
+
+int barMin = hour(time_close, tzInput) * 60 + minute(time_close, tzInput)
+int marketOpen = 9 * 60 + 15
+int orEndMin = marketOpen + orMinutes
+int sqOffMin = squareOffH * 60 + squareOffM
+
+bool isInOR = barMin >= marketOpen and barMin < orEndMin
+bool isAfterOR = barMin >= orEndMin
+bool isSquareOff = barMin >= sqOffMin
+bool isEntryWindow = isAfterOR and not isSquareOff
+
+var float orHigh = na
+var float orLow = na
+var bool orDefined = false
+bool isDayChange = ta.change(time("D")) != 0
+
+if isDayChange
+    orHigh := na
+    orLow := na
+    orDefined := false
+
+if isInOR
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow := na(orLow) ? low : math.min(orLow, low)
+
+if isAfterOR and not na(orHigh) and not na(orLow)
+    orDefined := true
+
+float orRange = orDefined ? orHigh - orLow : na
+bool orWidthOk = orDefined and not na(orRange) and orRange >= minOrRange and orRange <= maxOrRange
+
+var int tradesToday = 0
+var bool firedLongToday = false
+var bool firedShortToday = false
+
+if isDayChange
+    tradesToday := 0
+    firedLongToday := false
+    firedShortToday := false
+
+var float activeStop = na
+var float activeTarget = na
+var int entryBarIdx = na
+var string skipReason = "—"
+
+if strategy.position_size == 0 and nz(strategy.position_size[1]) != 0
+    activeStop := na
+    activeTarget := na
+    entryBarIdx := na
+
+bool longBreak = barstate.isconfirmed and orDefined and isAfterOR and close > orHigh
+bool shortBreak = barstate.isconfirmed and orDefined and isAfterOR and close < orLow
+bool vwapLongOk = not useVwapFilter or close > vwapVal
+bool vwapShortOk = not useVwapFilter or close < vwapVal
+
+bool isFlat = strategy.position_size == 0
+bool canTrade = isEntryWindow and tradesToday < maxTradesDay and isFlat
+
+bool buyCe = longBreak and vwapLongOk and adxOk and orWidthOk and canTrade and not firedLongToday and isFlat
+bool buyPe = shortBreak and vwapShortOk and adxOk and orWidthOk and canTrade and not firedShortToday and isFlat
+
+// Track why no entry on breakout bars (dashboard)
+if barstate.isconfirmed and isEntryWindow and longBreak and isFlat
+    skipReason := not orWidthOk ? (orRange > maxOrRange ? "OR wide" : "OR narrow") : not adxOk ? "ADX low" : not vwapLongOk ? "VWAP" : firedLongToday ? "CE done" : "—"
+if barstate.isconfirmed and isEntryWindow and shortBreak and isFlat
+    skipReason := not orWidthOk ? (orRange > maxOrRange ? "OR wide" : "OR narrow") : not adxOk ? "ADX low" : not vwapShortOk ? "VWAP" : firedShortToday ? "PE done" : "—"
+
+if closeOnlySl and strategy.position_size > 0 and not na(activeTarget)
+    strategy.exit("CE_TGT", from_entry = "BUY_CE", limit = activeTarget, disable_alert = true)
+if closeOnlySl and strategy.position_size < 0 and not na(activeTarget)
+    strategy.exit("PE_TGT", from_entry = "BUY_PE", limit = activeTarget, disable_alert = true)
+
+bool slDelayOk = not na(entryBarIdx) and bar_index - entryBarIdx >= 0
+if closeOnlySl and barstate.isconfirmed and slDelayOk and strategy.position_size > 0 and not na(activeStop) and close <= activeStop
+    strategy.close("BUY_CE", comment = "SL")
+if closeOnlySl and barstate.isconfirmed and slDelayOk and strategy.position_size < 0 and not na(activeStop) and close >= activeStop
+    strategy.close("BUY_PE", comment = "SL")
+
+if barstate.isconfirmed and isSquareOff and strategy.position_size != 0
+    strategy.close_all(comment = "EOD")
+
+if buyCe and not na(orLow)
+    float sl = f_longStop(close, orLow)
+    float tg = f_longTarget(close, atrVal)
+    if close > sl and tg > close
+        activeStop := sl
+        activeTarget := tg
+        entryBarIdx := bar_index
+        strategy.entry("BUY_CE", strategy.long, comment = "CE")
+        tradesToday += 1
+        firedLongToday := true
+
+if buyPe and not na(orHigh)
+    float sl = f_shortStop(close, orHigh)
+    float tg = f_shortTarget(close, atrVal)
+    if sl > close and tg < close
+        activeStop := sl
+        activeTarget := tg
+        entryBarIdx := bar_index
+        strategy.entry("BUY_PE", strategy.short, comment = "PE")
+        tradesToday += 1
+        firedShortToday := true
+
+plot(showOrLines and orDefined ? orHigh : na, "OR High", color = color.new(color.green, 20), linewidth = 2, style = plot.style_linebr)
+plot(showOrLines and orDefined ? orLow : na, "OR Low", color = color.new(color.red, 20), linewidth = 2, style = plot.style_linebr)
+bgcolor(not orWidthOk and orDefined and isAfterOR ? color.new(color.orange, 88) : isInOR ? color.new(color.yellow, 92) : na)
+
+var table dash = table.new(position.top_right, 2, 8, border_width = 1)
+if barstate.islast and showDash
+    string orStat = not orDefined ? "forming" : orWidthOk ? "OK" : orRange > maxOrRange ? "WIDE" : "NARROW"
+    table.cell(dash, 0, 0, "OR", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 0, str.tostring(orRange, "#") + " " + orStat, bgcolor = orWidthOk ? color.green : color.orange, text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 1, "Trades", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 1, str.tostring(tradesToday) + "/" + str.tostring(maxTradesDay), text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 2, "Skip", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 2, skipReason, text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 3, "Net P&L", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 3, str.tostring(strategy.netprofit, "#.##"), text_color = color.white, text_size = size.small)
+
+alertcondition(buyCe, "BUY CE", "Entry v2: BUY CE")
+alertcondition(buyPe, "BUY PE", "Entry v2: BUY PE")

@@ -12,7 +12,7 @@ AUTO_TRADE: bool = False
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    """Frozen config matching Pine v3.7 locked parameters."""
+    """Strategy parameters — v3.7 entries, exit sweep winner (OR stop + close-only SL)."""
 
     or_minutes: int = 15
     or_bars_5m: int = 3
@@ -28,7 +28,12 @@ class StrategyConfig:
     atr_sl_mult: float = 1.4
     atr_target_mult: float = 1.2
     rr_ratio: float = 2.0
-    sl_mode: str = "ATR"
+    sl_mode: str = "OR_RANGE"  # ATR | OR_RANGE | WIDER
+
+    # Exit sweep winner: OR_RANGE stop, SL on bar close only, 10pt buffer
+    close_only_sl: bool = True
+    sl_delay_bars: int = 0
+    sl_buffer_pts: float = 10.0
 
     market_open_h: int = 9
     market_open_m: int = 15
@@ -115,6 +120,10 @@ def load_app_config(env_file: str | Path | None = ".env") -> AppConfig:
         atr_sl_mult=float(os.getenv("ATR_SL_MULT", DEFAULT_CONFIG.atr_sl_mult)),
         atr_target_mult=float(os.getenv("ATR_TARGET_MULT", DEFAULT_CONFIG.atr_target_mult)),
         rr_ratio=float(os.getenv("RR_RATIO", DEFAULT_CONFIG.rr_ratio)),
+        sl_mode=os.getenv("SL_MODE", DEFAULT_CONFIG.sl_mode),
+        close_only_sl=_env_bool("CLOSE_ONLY_SL", DEFAULT_CONFIG.close_only_sl),
+        sl_delay_bars=_env_int("SL_DELAY_BARS", DEFAULT_CONFIG.sl_delay_bars),
+        sl_buffer_pts=float(os.getenv("SL_BUFFER_PTS", DEFAULT_CONFIG.sl_buffer_pts)),
         max_trades_per_day=_env_int("MAX_TRADES_PER_DAY", DEFAULT_CONFIG.max_trades_per_day),
         use_vwap_filter=_env_bool("USE_VWAP_FILTER", DEFAULT_CONFIG.use_vwap_filter),
         timezone=os.getenv("TIMEZONE", DEFAULT_CONFIG.timezone),

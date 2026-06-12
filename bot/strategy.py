@@ -1,4 +1,4 @@
-"""NIFTY Spot Signal Engine v3.7 — bar-close signal logic (Phase 0)."""
+"""NIFTY Spot Signal Engine — v3.7 entries, OR_RANGE + close-only SL exits."""
 
 from __future__ import annotations
 
@@ -118,21 +118,26 @@ def _calc_stop(
         return None
 
     atr_stop_dist = atr * cfg.atr_sl_mult
+    buffer = cfg.sl_buffer_pts
     if side == PositionSide.CE:
-        long_stop_atr = entry - atr_stop_dist
-        long_stop_or = or_low
+        long_stop_atr = entry - atr_stop_dist - buffer
+        long_stop_or = or_low - buffer
         if cfg.sl_mode == "ATR":
             return long_stop_atr
         if cfg.sl_mode == "OR_RANGE":
             return long_stop_or
+        if cfg.sl_mode == "WIDER":
+            return min(long_stop_atr, long_stop_or)
         return max(long_stop_atr, long_stop_or)
 
-    short_stop_atr = entry + atr_stop_dist
-    short_stop_or = or_high
+    short_stop_atr = entry + atr_stop_dist + buffer
+    short_stop_or = or_high + buffer
     if cfg.sl_mode == "ATR":
         return short_stop_atr
     if cfg.sl_mode == "OR_RANGE":
         return short_stop_or
+    if cfg.sl_mode == "WIDER":
+        return max(short_stop_atr, short_stop_or)
     return min(short_stop_atr, short_stop_or)
 
 
@@ -160,6 +165,7 @@ def _check_exit_on_bar(
     position: Position,
     bar: BarContext,
     logger: ReplayLogger,
+    cfg: StrategyConfig = DEFAULT_CONFIG,
 ) -> bool:
     """Intrabar SL/target check. SL takes priority if both touched (conservative)."""
     if position.side == PositionSide.FLAT:
@@ -171,9 +177,20 @@ def _check_exit_on_bar(
     if target is None or entry is None:
         return False
 
+    bars_in_trade = (
+        bar.index - position.entry_bar_index
+        if position.entry_bar_index is not None
+        else cfg.sl_delay_bars
+    )
+    sl_active = bars_in_trade >= cfg.sl_delay_bars
+
     exited = False
     if position.side == PositionSide.CE:
-        sl_hit = stop is not None and bar.low <= stop
+        sl_hit = (
+            sl_active
+            and stop is not None
+            and (bar.close <= stop if cfg.close_only_sl else bar.low <= stop)
+        )
         tgt_hit = not sl_hit and bar.high >= target
         if sl_hit:
             logger.log(
@@ -204,7 +221,11 @@ def _check_exit_on_bar(
             )
             exited = True
     else:
-        sl_hit = stop is not None and bar.high >= stop
+        sl_hit = (
+            sl_active
+            and stop is not None
+            and (bar.close >= stop if cfg.close_only_sl else bar.high >= stop)
+        )
         tgt_hit = not sl_hit and bar.low <= target
         if sl_hit:
             logger.log(
@@ -256,7 +277,7 @@ def process_bar(
 
     position = state.position
     if position.side != PositionSide.FLAT:
-        if _check_exit_on_bar(position, bar, logger):
+        if _check_exit_on_bar(position, bar, logger, cfg):
             return
 
     if bar.is_square_off and position.side != PositionSide.FLAT:

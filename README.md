@@ -79,8 +79,8 @@ powershell -ExecutionPolicy Bypass -File scripts\run_market_session.ps1
 
 - OR: 09:15–09:30 (Pine `isInOR` / bar-close semantics)
 - Signals: 09:30–15:15 | Square-off: 15:15 | Stop: 15:30
-- OR width 25–100 | VWAP (futures proxy) | ADX ≥ 15
-- SL = 1.2×ATR | Target = 1.8R | Max 2 trades/day
+- OR width 25–100 | VWAP (futures proxy) | ADX ≥ 18
+- SL = OR low/high + 10pt buffer (close-only, ignore wicks) | Target = 1.2×ATR×2.0 | Max 2 trades/day
 
 ### Files
 
