@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import pytest
+
 from bot.option_lookup import (
     OptionQuote,
     compute_premium_levels,
+    estimate_premium_change,
+    estimate_premium_pnl_per_share,
+    format_entry_pnl_lines,
     format_option_lines,
     format_premium_risk_lines,
     pick_strike,
     round_nifty_strike,
+    spot_pnl_points,
 )
 
 
@@ -76,3 +82,70 @@ def test_premium_levels_none_without_ask():
         bid=39.0,
     )
     assert "ask" in "\n".join(format_premium_risk_lines(q)).lower()
+
+
+def test_spot_pnl_points_pe_and_ce():
+    assert spot_pnl_points(23931.80, 23888.15, "PE") == pytest.approx(43.65)
+    assert spot_pnl_points(23931.80, 24021.40, "PE") == pytest.approx(-89.6)
+    assert spot_pnl_points(23200.0, 23300.0, "CE") == 100.0
+
+
+def test_estimate_premium_pnl_per_share():
+    assert estimate_premium_pnl_per_share(-0.45, 23931.80, 23888.15) == pytest.approx(19.6425)
+    assert estimate_premium_pnl_per_share(-0.45, 23931.80, 24021.40) == pytest.approx(-40.32)
+
+
+def test_format_entry_pnl_lines_with_delta():
+    lines = format_entry_pnl_lines(
+        entry=23931.80,
+        stop=24021.40,
+        target=23888.15,
+        side="PE",
+        delta=-0.45,
+        theta=-8.2,
+        iv=0.185,
+        gamma=0.0004,
+        atr=18.2,
+    )
+    text = "\n".join(lines)
+    assert "P&amp;L IF SPOT LEVELS HIT" in text
+    assert "+43.6 pts" in text
+    assert "-89.6 pts" in text
+    assert "OR stop" in text
+    assert "<b>δ=-0.45</b>" in text
+    assert "<b>θ=-8.2/day</b>" in text
+    assert "<b>IV=18.5%</b>" in text
+    assert "δ+θ+½γΔS²" in text
+    assert "IV flat" in text
+
+
+def test_estimate_premium_change_includes_theta():
+    # 90 min hold, theta -8.2/day -> -8.2 * (90/375) ≈ -1.97
+    delta_only = estimate_premium_change(
+        spot_entry=23931.80,
+        spot_exit=23888.15,
+        delta=-0.45,
+        hold_minutes=90,
+    )
+    with_theta = estimate_premium_change(
+        spot_entry=23931.80,
+        spot_exit=23888.15,
+        delta=-0.45,
+        theta=-8.2,
+        gamma=0.0004,
+        hold_minutes=90,
+    )
+    assert with_theta is not None and delta_only is not None
+    assert with_theta < delta_only  # time decay hurts long option
+
+
+def test_format_entry_pnl_lines_spot_only_without_delta():
+    lines = format_entry_pnl_lines(
+        entry=23931.80,
+        stop=24021.40,
+        target=23888.15,
+        side="PE",
+    )
+    text = "\n".join(lines)
+    assert "+43.6 pts" in text
+    assert "Option est." not in text

@@ -86,6 +86,9 @@ class AppConfig:
 
     strike_mode: str = "ATM_OR_ITM1"  # ATM | ITM1 | ATM_OR_ITM1
 
+    # Heads-up when OR is breached on the forming 5m bar (official entry still at bar close)
+    enable_early_or_watch: bool = True
+
     timezone: str = "Asia/Kolkata"
 
 
@@ -190,6 +193,7 @@ def load_app_config(env_file: str | Path | None = ".env") -> AppConfig:
         max_fetch_retries=_env_int("MAX_FETCH_RETRIES", 3),
         retry_backoff_sec=float(os.getenv("RETRY_BACKOFF_SEC", "2.0")),
         strike_mode=os.getenv("STRIKE_MODE", "ATM_OR_ITM1").upper(),
+        enable_early_or_watch=_env_bool("ENABLE_EARLY_OR_WATCH", True),
         timezone=os.getenv("TIMEZONE", "Asia/Kolkata"),
     )
 

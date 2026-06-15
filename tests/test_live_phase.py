@@ -108,6 +108,7 @@ def test_telegram_format_buy_ce():
     assert "BUY_CE" in text
     assert "23267.25" in text
     assert "BUY CALL" in text
+    assert "<b>14:55 IST</b>" in text
 
 
 def test_monitor_window_helpers():

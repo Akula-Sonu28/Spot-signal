@@ -29,6 +29,8 @@ def _cfg() -> AppConfig:
 def test_parse_command():
     assert parse_command("/status") == ParsedCommand("status", ())
     assert parse_command("/start@MyBot") == ParsedCommand("start", ())
+    assert parse_command("/pos") == ParsedCommand("position", ())
+    assert parse_command("/ping") == ParsedCommand("ping", ())
     assert parse_command("hello") is None
     assert parse_command("/unknown") is None
 
@@ -56,8 +58,11 @@ def test_session_process_control_messages(tmp_path: Path, monkeypatch):
 
     proc = SessionProcessControl(lock_file=lock, start_script=script, session_log=log)
     proc.project_root = tmp_path
-    monkeypatch.setattr(proc, "is_running", lambda: False)
-    assert "Starting" in proc.start()
+    monkeypatch.setattr("bot.telegram_commands.time.sleep", lambda _: None)
+    states = iter([False, True])
+    monkeypatch.setattr(proc, "is_running", lambda: next(states, True))
+    msg = proc.start()
+    assert "started" in msg.lower() or "pid" in msg.lower()
     monkeypatch.setattr(proc, "is_running", lambda: True)
     assert proc.start().startswith("Already running")
     assert proc.last_log_line() == "line2"
@@ -165,6 +170,193 @@ def test_handler_status_and_tick(tmp_path: Path, monkeypatch):
     sent.clear()
     handler._dispatch(ParsedCommand("help", ()))
     assert "/stop" in sent[0]
+    assert "/ping" in sent[0]
+    assert "/health" in sent[0]
+
+
+def test_new_command_dispatch(tmp_path: Path, monkeypatch):
+    from zoneinfo import ZoneInfo
+
+    cfg = AppConfig(
+        upstox_access_token="x",
+        telegram_bot_token="x",
+        telegram_chat_id="12345",
+        state_file=tmp_path / "monitor_state.json",
+        event_log_csv=tmp_path / "signals.csv",
+    )
+    sent: list[str] = []
+
+    class FakeAlerter:
+        def send(self, text: str, *, parse_mode: str | None = None) -> None:
+            sent.append(text)
+
+    monkeypatch.setattr("bot.telegram_commands._project_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        "bot.telegram_commands.probe_market_feed",
+        lambda _cfg, _now: __import__(
+            "bot.telegram_status", fromlist=["FeedProbeResult"]
+        ).FeedProbeResult(ok=True, last_close=24000.0),
+    )
+
+    from bot.state import LiveMonitorState, make_day_state
+
+    day = make_day_state("2026-06-15")
+    day.or_defined = True
+    day.or_high = 24000.0
+    day.or_low = 23920.0
+    day.day_mode = "V38"
+    monitor = LiveMonitorState(session_date="2026-06-15", day=day)
+    monitor.save(tmp_path / "monitor_state.json")
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 6, 15, 12, 12, tzinfo=ZoneInfo("Asia/Kolkata"))
+
+    monkeypatch.setattr("bot.telegram_commands.datetime", FixedDatetime)
+    handler = TelegramCommandHandler(cfg, FakeAlerter())  # type: ignore[arg-type]
+
+    handler._dispatch(ParsedCommand("ping", ()))
+    assert sent and "Pong" in sent[-1]
+
+    sent.clear()
+    handler._dispatch(ParsedCommand("health", ()))
+    assert sent and "Health check" in sent[-1]
+
+    sent.clear()
+    handler._dispatch(ParsedCommand("or", ()))
+    assert sent and "Opening Range" in sent[-1]
+
+    sent.clear()
+    handler._dispatch(ParsedCommand("position", ()))
+    assert sent and "FLAT" in sent[-1]
+
+    sent.clear()
+    handler._dispatch(ParsedCommand("today", ()))
+    assert sent and "Today" in sent[-1]
+
+    sent.clear()
+    handler._dispatch(ParsedCommand("levels", ()))
+    assert sent and "Levels vs OR" in sent[-1]
+
+    sent.clear()
+    handler._dispatch(ParsedCommand("next", ()))
+    assert sent and "Next bar" in sent[-1]
+
+
+def test_restart_calls_stop_then_start(monkeypatch):
+    from zoneinfo import ZoneInfo
+
+    sent: list[str] = []
+    calls: list[str] = []
+
+    class FakeAlerter:
+        def send(self, text: str, *, parse_mode: str | None = None) -> None:
+            sent.append(text)
+
+    class FakeProcess:
+        def stop(self) -> str:
+            calls.append("stop")
+            return "Not running."
+
+        def start(self) -> str:
+            calls.append("start")
+            return "Market session started (pid 99)."
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 6, 15, 10, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+
+    monkeypatch.setattr("bot.telegram_commands.datetime", FixedDatetime)
+    monkeypatch.setattr("bot.telegram_commands.time.sleep", lambda _: None)
+    handler = TelegramCommandHandler(_cfg(), FakeAlerter(), process=FakeProcess())  # type: ignore[arg-type]
+    handler._dispatch(ParsedCommand("restart", ()))
+    assert calls == ["stop", "start"]
+    assert sent and "Restart:" in sent[0]
+
+
+def test_ping_does_not_call_probe(tmp_path: Path, monkeypatch):
+    from zoneinfo import ZoneInfo
+
+    sent: list[str] = []
+    probe_called = {"n": 0}
+
+    class FakeAlerter:
+        def send(self, text: str, *, parse_mode: str | None = None) -> None:
+            sent.append(text)
+
+    def fake_probe(*_args, **_kwargs):
+        probe_called["n"] += 1
+        raise AssertionError("probe should not run for /ping")
+
+    monkeypatch.setattr("bot.telegram_commands.probe_market_feed", fake_probe)
+    monkeypatch.setattr("bot.telegram_commands._project_root", lambda: tmp_path)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 6, 15, 12, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+
+    monkeypatch.setattr("bot.telegram_commands.datetime", FixedDatetime)
+    handler = TelegramCommandHandler(_cfg(), FakeAlerter())  # type: ignore[arg-type]
+    handler._dispatch(ParsedCommand("ping", ()))
+    assert probe_called["n"] == 0
+    assert sent and "Pong" in sent[0]
+
+
+def test_unknown_command_gets_reply():
+    sent: list[str] = []
+
+    class FakeAlerter:
+        def send(self, text: str, *, parse_mode: str | None = None) -> None:
+            sent.append(text)
+
+    handler = TelegramCommandHandler(_cfg(), FakeAlerter())  # type: ignore[arg-type]
+    handler.updates = MagicMock()
+    handler.updates.fetch_updates.return_value = [{
+        "update_id": 1,
+        "message": {"chat": {"id": 12345}, "text": "/reboot"},
+    }]
+    handler.updates.acknowledge = MagicMock()
+    handler.poll_once()
+    assert sent and "Unknown command" in sent[0]
+
+
+def test_can_manual_start_session_before_monitor_open():
+    from zoneinfo import ZoneInfo
+
+    from bot.scheduler import can_manual_start_session
+
+    cfg = _cfg().strategy
+    early = datetime(2026, 6, 11, 9, 12, tzinfo=ZoneInfo("Asia/Kolkata"))
+    assert can_manual_start_session(early, cfg)
+    too_early = datetime(2026, 6, 11, 9, 5, tzinfo=ZoneInfo("Asia/Kolkata"))
+    assert not can_manual_start_session(too_early, cfg)
+
+
+def test_scheduler_sleep_wakes_on_force_tick(tmp_path: Path, monkeypatch):
+    from bot.scheduler import LiveScheduler
+
+    monkeypatch.setattr("bot.telegram_commands._project_root", lambda: tmp_path)
+    flag = tmp_path / "data/live/force_tick.request"
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text("x", encoding="utf-8")
+
+    tick = {"t": 0.0}
+
+    def mono() -> float:
+        tick["t"] += 0.5
+        return tick["t"]
+
+    slept: list[float] = []
+    monkeypatch.setattr("bot.scheduler.time.monotonic", mono)
+    monkeypatch.setattr("bot.scheduler.time.sleep", lambda s: slept.append(s))
+
+    cfg = AppConfig(upstox_access_token="x", telegram_bot_token="x", telegram_chat_id="x", poll_interval_sec=20)
+    sched = LiveScheduler(cfg, MagicMock(), MagicMock())  # type: ignore[arg-type]
+    sched._sleep_until_next_poll()
+    assert sum(slept) < 5
 
 
 def test_force_tick_flag_helpers(tmp_path: Path, monkeypatch):

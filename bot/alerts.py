@@ -7,6 +7,7 @@ import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from typing import Any
 
 
@@ -40,21 +41,20 @@ def _urlopen(req: urllib.request.Request, timeout: int = 20):  # type: ignore[re
 
 
 from bot.config import LOCKED_STRATEGY_VERSION, AppConfig
+from bot.early_watch import bar_close_time
 from bot.logger import SignalEvent
-from bot.option_lookup import OptionQuote, format_option_lines, format_premium_risk_lines
+from bot.option_lookup import OptionQuote, PREMIUM_SL_LOSS_FRAC, format_entry_pnl_lines
 from bot.state import Position
-
-
-def _fmt(v: float | None, decimals: int = 2) -> str:
-    return f"{v:.{decimals}f}" if v is not None else "—"
-
-
-def _pts(v: float | None) -> str:
-    return f"{v:.0f} pts" if v is not None else "—"
-
-
-def _pct(v: float | None) -> str:
-    return f"{v:.1f}%" if v is not None else "—"
+from bot.telegram_format import (
+    DIVIDER,
+    bold,
+    code,
+    html_escape,
+    italic,
+    price,
+    pts_signed,
+    section,
+)
 
 
 def _risk_reward_label(entry: float, stop: float | None, target: float | None) -> str:
@@ -66,7 +66,7 @@ def _risk_reward_label(entry: float, stop: float | None, target: float | None) -
     if risk == 0:
         return "—"
     rr = reward / risk
-    return f"{rr:.1f}R"
+    return bold(f"{rr:.1f}R")
 
 
 def _spot_vs_or(price: float, or_high: float | None, or_low: float | None,
@@ -82,26 +82,26 @@ def _spot_vs_or(price: float, or_high: float | None, or_low: float | None,
         return f"{dist:.0f} pts below OR Low"
 
 
-def _pnl_spot(entry: float | None, exit_price: float, side: str) -> str:
-    """Spot P&L in points."""
-    if entry is None:
-        return ""
-    if side in ("CE", "LONG_EXIT"):
-        pts = exit_price - entry
-    else:
-        pts = entry - exit_price
-    arrow = "🟢 +" if pts > 0 else "🔴 "
-    return f"{arrow}{pts:.1f} pts"
-
-
-def _pnl_premium(entry_ask: float | None, sl_frac: float = 0.5,
-                 rr: float = 2.0) -> tuple[str, str]:
-    """Return (sl_str, target_str) for premium risk."""
+def _premium_backup_line(entry_ask: float | None) -> str | None:
+    """Rough premium stop — not tied to spot SL (see TRADING_GUIDE)."""
     if entry_ask is None or entry_ask <= 0:
-        return "—", "—"
-    sl = entry_ask * (1 - sl_frac)
-    target = entry_ask + (entry_ask - sl) * rr
-    return f"₹{sl:.2f}", f"₹{target:.2f}"
+        return None
+    backup = round(entry_ask * (1.0 - PREMIUM_SL_LOSS_FRAC), 2)
+    return (
+        f"{bold('Backup')}: consider exit if premium −50% "
+        f"(≈ {bold(f'₹{backup:.2f}')})"
+    )
+
+
+def _spot_exit_plan(stop: float | None, target: float | None) -> str:
+    return (
+        f"Exit when SPOT hits SL {price(stop)} or Target {price(target)}"
+    )
+
+
+def _bar_close_label(bar_open: datetime, *, bar_time_is_open: bool = True) -> str:
+    close_ts = bar_close_time(bar_open, bar_time_is_open=bar_time_is_open)
+    return close_ts.strftime("%H:%M IST")
 
 
 class TelegramAlerter:
@@ -128,26 +128,31 @@ class TelegramAlerter:
             detail = exc.read().decode(errors="replace")
             raise RuntimeError(f"Telegram HTTP {exc.code}: {detail}") from exc
 
+    def _send_html(self, text: str) -> None:
+        self.send(text, parse_mode="HTML")
+
     # ── System messages ───────────────────────────────────────────────────────
 
     def bot_started(self) -> None:
-        self.send(
-            f"🟢 NIFTY Signal Engine  •  LIVE  (v{LOCKED_STRATEGY_VERSION})\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Mode:       ALERTS ONLY  (no auto-trade)\n"
+        self._send_html(
+            f"🟢 {bold('NIFTY Signal Engine')}  •  {bold('LIVE')}  "
+            f"({code(f'v{LOCKED_STRATEGY_VERSION}')})\n"
+            f"{DIVIDER}\n"
+            f"Mode:       {bold('ALERTS ONLY')}  (no auto-trade)\n"
             "Instrument: NIFTY 50  |  5m bars  |  IST\n"
             "Session:    09:15 – 15:30\n"
             "Signals:    09:30 – 15:15  (post-OR)\n"
             "Playbook:   set after OR  (v3.8 / J+ / skip)\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Waiting for Opening Range…"
+            "Alerts:     WATCH (forming bar) + BUY on bar close\n"
+            f"{DIVIDER}\n"
+            f"{italic('Waiting for Opening Range…')}"
         )
 
     def bot_stopped(self, reason: str = "shutdown") -> None:
-        self.send(
-            f"🔴 NIFTY Signal Engine  •  STOPPED\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Reason: {reason}"
+        self._send_html(
+            f"🔴 {bold('NIFTY Signal Engine')}  •  {bold('STOPPED')}\n"
+            f"{DIVIDER}\n"
+            f"Reason: {html_escape(reason)}"
         )
 
     def or_ready(
@@ -160,63 +165,105 @@ class TelegramAlerter:
         enable_j_plus: bool = True,
     ) -> None:
         if day_mode == "SKIP":
-            mode_line = "Mode: SKIP — OR too narrow, no trades today"
-            action = "No entries for this session."
+            mode_line = f"{bold('Mode: SKIP')} — OR too narrow, no trades today"
+            action = italic("No entries for this session.")
         elif day_mode == "J_PLUS" and not enable_j_plus:
-            mode_line = "Mode: Wide OR — J+ disabled"
+            mode_line = f"{bold('Mode: Wide OR')} — J+ disabled"
             action = (
-                "OR width > 100 pts but ENABLE_J_PLUS=false.\n"
-                "No entries for this session."
+                "OR width &gt; 100 pts but ENABLE_J_PLUS=false.\n"
+                f"{italic('No entries for this session.')}"
             )
         elif day_mode == "J_PLUS":
-            mode_line = "Mode: J+ trap-fade (wide OR)"
+            mode_line = f"{bold('Mode: J+ trap-fade')} (wide OR)"
             action = (
                 "Fake-break trap fade only. Max 1 trade after ~10:00 IST.\n"
-                "v3.8 breakout module is OFF today."
+                f"{italic('v3.8 breakout module is OFF today.')}"
             )
         else:
-            mode_line = "Mode: v3.8 OR breakout"
+            mode_line = f"{bold('Mode: v3.8 OR breakout')}"
             action = (
-                f"📈 Breakout:  above {or_high:.2f}  →  BUY CE\n"
-                f"📉 Breakdown: below {or_low:.2f}  →  BUY PE\n"
-                "J+ trap module is OFF today."
+                f"📈 Breakout:  above {price(or_high)}  →  {bold('BUY CE')}\n"
+                f"📉 Breakdown: below {price(or_low)}  →  {bold('BUY PE')}\n"
+                "👀 WATCH_CE/PE on forming bar (heads-up only)\n"
+                f"🔔 {bold('BUY_CE/PE')} on 5m bar close (~5 min after WATCH)\n"
+                f"{italic('J+ trap module is OFF today.')}"
             )
 
-        self.send(
-            "📊 Opening Range Set\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"OR High:  {or_high:.2f}\n"
-            f"OR Low:   {or_low:.2f}\n"
-            f"Width:    {width:.0f} pts\n"
+        self._send_html(
+            f"{section('📊 Opening Range Set')}\n"
+            f"{DIVIDER}\n"
+            f"OR High:  {price(or_high)}\n"
+            f"OR Low:   {price(or_low)}\n"
+            f"Width:    {bold(f'{width:.0f} pts')}\n"
             f"{mode_line}\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{DIVIDER}\n"
             f"{action}\n"
-            "Signal window: 09:30 – 15:15 IST"
+            f"{italic('Signal window: 09:30 – 15:15 IST')}"
         )
 
     def data_error(self, message: str, *, during_signal_hours: bool = False) -> None:
         if during_signal_hours:
-            header = "🚨 Feed issue during SIGNAL HOURS"
+            header = section("🚨 Feed issue during SIGNAL HOURS")
         else:
-            header = "⚠️ Data / API warning"
-        self.send(
+            header = section("⚠️ Data / API warning")
+        self._send_html(
             f"{header}\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{message}\n"
-            "No signals generated this tick."
+            f"{DIVIDER}\n"
+            f"{html_escape(message)}\n"
+            f"{italic('No signals generated this tick.')}"
         )
 
     def signals_paused(self, minutes_without_bars: int) -> None:
-        self.send(
-            "🚨 Signals Paused\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"No 5m bars for {minutes_without_bars}+ min during signal window.\n"
-            "⚠️ You may miss trades until the feed recovers.\n"
-            "Action: check Upstox status / bot log."
+        self._send_html(
+            f"{section('🚨 Signals Paused')}\n"
+            f"{DIVIDER}\n"
+            f"No 5m bars for {bold(f'{minutes_without_bars}+ min')} during signal window.\n"
+            f"⚠️ {bold('You may miss trades')} until the feed recovers.\n"
+            f"Action: check Upstox status / bot log."
+        )
+
+    def or_break_pending(
+        self,
+        watch_type: str,
+        spot: float,
+        or_high: float,
+        or_low: float,
+        bar_open: datetime,
+        *,
+        now: datetime,
+        vwap: float | None = None,
+        adx: float | None = None,
+        bar_time_is_open: bool = True,
+    ) -> None:
+        """Heads-up while the current 5m bar is breaking OR (not a confirmed entry)."""
+        is_ce = watch_type == "WATCH_CE"
+        side = "CE" if is_ce else "PE"
+        action = "BUY CALL (CE)" if is_ce else "BUY PUT (PE)"
+        close_ts = bar_close_time(bar_open, bar_time_is_open=bar_time_is_open)
+        breakout = _spot_vs_or(spot, or_high, or_low, side)
+        adx_str = f"{adx:.1f}" if adx is not None else "—"
+        vwap_note = ""
+        if vwap is not None:
+            vwap_note = bold("above VWAP ✓") if spot > vwap else bold("below VWAP ✓")
+
+        self._send_html(
+            f"👀 {bold(watch_type)}  •  OR "
+            f"{'breakout' if is_ce else 'breakdown'} forming\n"
+            f"{DIVIDER}\n"
+            f"⏰ Now: {bold(now.strftime('%H:%M IST'))}\n"
+            f"⏳ Confirms at bar close: {bold(close_ts.strftime('%H:%M IST'))}\n"
+            f"📌 If confirmed → {bold(action)}\n"
+            f"{DIVIDER}\n"
+            f"📍 Spot (live): {price(spot)}  ({html_escape(breakout)})\n"
+            f"📊 OR High: {price(or_high)}  |  Low: {price(or_low)}\n"
+            f"📡 {vwap_note or 'VWAP: —'}  |  ADX: {bold(adx_str)}\n"
+            f"{DIVIDER}\n"
+            f"⚠️ {bold('NOT an entry')} — wait for official BUY alert after bar close.\n"
+            f"{italic('Price can recover before the candle closes.')}"
         )
 
     def signal_event(self, event: SignalEvent, position: Position | None = None) -> None:
-        self.send(self.format_signal(event, self.cfg, position))
+        self._send_html(self.format_signal(event, self.cfg, position))
 
     # ── Signal formatting ─────────────────────────────────────────────────────
 
@@ -245,6 +292,11 @@ class TelegramAlerter:
                 ask=extra.get("option_ask"),
                 spread=extra.get("option_spread"),
                 oi=extra.get("option_oi"),
+                delta=extra.get("option_delta"),
+                theta=extra.get("option_theta"),
+                iv=extra.get("option_iv"),
+                gamma=extra.get("option_gamma"),
+                vega=extra.get("option_vega"),
                 quote_ok=extra.get("option_bid") is not None,
                 note=str(extra.get("option_note", "")),
             )
@@ -261,22 +313,32 @@ class TelegramAlerter:
             )
 
         # ── route to formatter ────────────────────────────────────────────
+        bar_time_is_open = cfg.strategy.bar_time_is_open if cfg else True
         if et in ("BUY_CE", "BUY_PE"):
-            return TelegramAlerter._fmt_entry(et, event, extra, option_q,
-                                               rr_ratio, strike_mode)
+            return TelegramAlerter._fmt_entry(
+                et, event, extra, option_q, rr_ratio, strike_mode, bar_time_is_open,
+            )
         elif et in ("TARGET_CE", "TARGET_PE", "SL_CE", "SL_PE"):
-            return TelegramAlerter._fmt_exit(et, event, extra, option_q,
-                                              rr_ratio, strike_mode)
+            return TelegramAlerter._fmt_exit(
+                et, event, extra, option_q, rr_ratio, strike_mode, bar_time_is_open,
+            )
         elif et == "SQUARE_OFF":
-            return TelegramAlerter._fmt_squareoff(event, extra, option_q,
-                                                   rr_ratio, strike_mode)
+            return TelegramAlerter._fmt_squareoff(
+                event, extra, option_q, rr_ratio, strike_mode, bar_time_is_open,
+            )
         else:
             return json.dumps(event.to_dict(), default=str)
 
     @staticmethod
-    def _fmt_entry(et: str, event: SignalEvent, extra: dict,
-                   option_q: OptionQuote | None,
-                   rr_ratio: float, strike_mode: str) -> str:
+    def _fmt_entry(
+        et: str,
+        event: SignalEvent,
+        extra: dict,
+        option_q: OptionQuote | None,
+        rr_ratio: float,
+        strike_mode: str,
+        bar_time_is_open: bool = True,
+    ) -> str:
         is_ce = et == "BUY_CE"
         direction = "LONG  📈" if is_ce else "SHORT  📉"
         action    = "BUY CALL (CE)" if is_ce else "BUY PUT (PE)"
@@ -299,9 +361,7 @@ class TelegramAlerter:
         vwap_gap    = entry - vwap if vwap else None
         vwap_side   = ("above" if vwap_gap and vwap_gap > 0 else "below") if vwap else None
 
-        # option premium levels
         ask = option_q.entry_ask() if option_q else None
-        prem_sl, prem_tgt = _pnl_premium(ask, rr=rr_ratio)
 
         lines = []
 
@@ -310,84 +370,110 @@ class TelegramAlerter:
 
         # header
         if extra.get("catch_up"):
-            lines.append(f"🔔 {et}  •  CATCH-UP ALERT")
-            lines.append("⏩ Signal fired earlier — act only if levels still valid")
+            lines.append(f"🔔 {bold(f'{et}  •  CATCH-UP ALERT')}")
+            lines.append(italic("⏩ Signal fired earlier — act only if levels still valid"))
         else:
-            lines.append(f"🔔 {et}  •  {module_tag}{direction}")
+            header = f"{et}  •  {module_tag}{direction}"
+            lines.append(f"🔔 {bold(header)}")
 
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        lines.append(f"⏰ {event.timestamp.strftime('%H:%M IST')}  |  Action: {action}")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(DIVIDER)
+        lines.append(
+            f"⏰ Bar close: {bold(_bar_close_label(event.timestamp, bar_time_is_open=bar_time_is_open))}"
+            f"  |  Action: {bold(action)}"
+        )
+        lines.append(DIVIDER)
 
         # spot levels
-        lines.append("📍 SPOT LEVELS")
-        lines.append(f"  Entry:   {entry:.2f}  ({breakout})")
-        lines.append(f"  SL:      {_fmt(stop)}  (risk {_pts(risk_pts)})")
-        lines.append(f"  Target:  {_fmt(target)}  (reward {_pts(reward_pts)})")
+        lines.append(section("📍 SPOT LEVELS"))
+        lines.append(f"  Entry:   {price(entry)}  ({html_escape(breakout)})")
+        risk_label = bold(f"{risk_pts:.0f} pts") if risk_pts is not None else "—"
+        reward_label = bold(f"{reward_pts:.0f} pts") if reward_pts is not None else "—"
+        lines.append(f"  SL:      {price(stop)}  (risk {risk_label})")
+        lines.append(f"  Target:  {price(target)}  (reward {reward_label})")
         lines.append(f"  R:R      {rr_label}")
+        lines.extend(
+            format_entry_pnl_lines(
+                entry=entry,
+                stop=stop,
+                target=target,
+                side=side_str,
+                delta=option_q.delta if option_q else extra.get("option_delta"),
+                theta=option_q.theta if option_q else extra.get("option_theta"),
+                iv=option_q.iv if option_q else extra.get("option_iv"),
+                gamma=option_q.gamma if option_q else extra.get("option_gamma"),
+                atr=atr,
+            )
+        )
 
         # OR context
         lines.append("")
-        lines.append("📊 OPENING RANGE")
-        lines.append(f"  High: {_fmt(or_high)}  |  Low: {_fmt(or_low)}")
+        lines.append(section("📊 OPENING RANGE"))
+        lines.append(f"  High: {price(or_high)}  |  Low: {price(or_low)}")
         if or_high and or_low:
-            lines.append(f"  Width: {or_high - or_low:.0f} pts")
+            lines.append(f"  Width: {bold(f'{or_high - or_low:.0f} pts')}")
 
         # indicators
         lines.append("")
-        lines.append("📡 INDICATORS")
+        lines.append(section("📡 INDICATORS"))
         adx_str = f"{adx:.1f}" if adx else "—"
         adx_tag = "  ✅ Strong" if adx and adx >= 25 else ("  ⚡ Moderate" if adx and adx >= 18 else "")
-        lines.append(f"  ADX:  {adx_str}{adx_tag}")
+        lines.append(f"  ADX:  {bold(adx_str)}{adx_tag}")
         if vwap and vwap_gap is not None:
-            lines.append(f"  VWAP: {vwap:.2f}  (price {vwap_side}, gap {abs(vwap_gap):.1f} pts)")
+            lines.append(
+                f"  VWAP: {price(vwap)}  "
+                f"(price {vwap_side}, gap {bold(f'{abs(vwap_gap):.1f} pts')})"
+            )
         if atr:
-            lines.append(f"  ATR:  {atr:.1f} pts  (1-candle volatility)")
+            lines.append(f"  ATR:  {bold(f'{atr:.1f} pts')}  (1-candle volatility)")
 
-        # option
+        # option (manual) — exits follow spot SL/target from strategy
         lines.append("")
-        lines.append(f"🎯 OPTION  •  {action}")
+        lines.append(section(f"🎯 OPTION (manual)  •  {action}"))
         if option_q:
-            lines.append(f"  {option_q.trading_symbol}")
-            lines.append(f"  Expiry: {option_q.expiry}")
+            symbol = option_q.trading_symbol or f"NIFTY {option_q.strike} {option_q.option_type}"
             if option_q.ask:
-                lines.append(f"  Ask (buy here): ₹{option_q.ask:.2f}")
-                if option_q.bid:
-                    lines.append(f"  Bid: ₹{option_q.bid:.2f}  |  Spread: {_fmt(option_q.spread, 2)}")
-                if option_q.ltp:
-                    lines.append(f"  LTP: ₹{option_q.ltp:.2f}")
-                if option_q.oi:
-                    lines.append(f"  OI:  {int(option_q.oi):,}")
+                lines.append(f"  {bold(html_escape(symbol))}  ·  Ask {bold(f'₹{option_q.ask:.2f}')}")
             else:
-                lines.append("  Ask unavailable — check broker app")
+                lines.append(f"  {bold(html_escape(symbol))}")
+            lines.append(f"  Expiry: {bold(html_escape(option_q.expiry))}")
+            if option_q.bid and option_q.spread is not None:
+                lines.append(
+                    f"  Bid {bold(f'₹{option_q.bid:.2f}')}  |  "
+                    f"Spread {bold(f'{option_q.spread:.2f}')}"
+                )
+            if option_q.oi:
+                lines.append(f"  OI: {bold(f'{int(option_q.oi):,}')}")
             if option_q.note:
-                lines.append(f"  ⚠️ {option_q.note}")
-
-            # premium risk
-            lines.append("")
-            lines.append("💰 OPTION RISK  (manual execution)")
-            if ask:
-                lines.append(f"  Buy at ask:   ₹{ask:.2f}")
-                lines.append(f"  Premium SL:   {prem_sl}  (50% loss → exit)")
-                lines.append(f"  Premium Tgt:  {prem_tgt}  ({rr_ratio:.0f}R on premium)")
-            else:
-                lines.append("  Set SL = 50% of your buy price")
-                lines.append(f"  Set Target = {rr_ratio:.0f}R on premium risk")
+                lines.append(f"  ⚠️ {html_escape(option_q.note)}")
+            lines.append(f"  {_spot_exit_plan(stop, target)}")
+            backup = _premium_backup_line(ask)
+            if backup:
+                lines.append(f"  {backup}")
+            elif not option_q.ask:
+                lines.append(italic("  Get ask from broker before entry"))
+                lines.append(italic("  Backup: ~40–50% premium loss if spot SL not reached"))
         else:
-            lines.append("  Strike/quote unavailable — check broker app")
+            lines.append(italic("  Strike/quote unavailable — check broker app"))
+            lines.append(f"  {_spot_exit_plan(stop, target)}")
 
         lines.append("")
         if is_j_plus:
-            lines.append(f"✅ Module: J+  |  Filters: {event.reason}")
+            lines.append(f"✅ Module: {bold('J+')}  |  Filters: {html_escape(event.reason)}")
         else:
-            lines.append(f"✅ Filters: {event.reason}")
+            lines.append(f"✅ Filters: {html_escape(event.reason)}")
 
         return "\n".join(lines)
 
     @staticmethod
-    def _fmt_exit(et: str, event: SignalEvent, extra: dict,
-                  option_q: OptionQuote | None,
-                  rr_ratio: float, strike_mode: str) -> str:
+    def _fmt_exit(
+        et: str,
+        event: SignalEvent,
+        extra: dict,
+        option_q: OptionQuote | None,
+        rr_ratio: float,
+        strike_mode: str,
+        bar_time_is_open: bool = True,
+    ) -> str:
         is_target = "TARGET" in et
         is_ce     = et.endswith("_CE")
         side_str  = "CE" if is_ce else "PE"
@@ -404,91 +490,98 @@ class TelegramAlerter:
                 spot_pnl = exit_price - entry
             else:
                 spot_pnl = entry - exit_price
-            pnl_pts   = f"{spot_pnl:+.1f} pts"
-            pnl_arrow = "🟢" if spot_pnl > 0 else "🔴"
-            pnl_pct   = f"({abs(spot_pnl)/entry*100:.2f}% move)"
+            pnl_line = pts_signed(spot_pnl)
+            pnl_pct = f"({bold(f'{abs(spot_pnl)/entry*100:.2f}%')} move)"
         else:
-            pnl_pts   = "—"
-            pnl_arrow = "⚪"
-            pnl_pct   = ""
+            pnl_line = "—"
+            pnl_pct = ""
 
         if is_target:
-            header = f"🎯 TARGET HIT  •  {trade_dir} EXIT ✅"
-            outcome = "PROFIT BOOKED"
+            header = f"🎯 {bold('TARGET HIT')}  •  {trade_dir} EXIT ✅"
+            outcome = bold("PROFIT BOOKED")
         else:
-            header = f"🛑 STOP HIT  •  {trade_dir} EXIT ❌"
-            outcome = "LOSS — SL TRIGGERED"
+            header = f"🛑 {bold('STOP HIT')}  •  {trade_dir} EXIT ❌"
+            outcome = bold("LOSS — SL TRIGGERED")
 
         ask = option_q.entry_ask() if option_q else extra.get("option_ask")
-        prem_sl, prem_tgt = _pnl_premium(ask, rr=rr_ratio)
 
         lines = [header]
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        lines.append(f"⏰ {event.timestamp.strftime('%H:%M IST')}  |  {outcome}")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(DIVIDER)
+        lines.append(
+            f"⏰ Bar close: {bold(_bar_close_label(event.timestamp, bar_time_is_open=bar_time_is_open))}"
+            f"  |  {outcome}"
+        )
+        lines.append(DIVIDER)
 
-        lines.append("📍 SPOT P&L")
-        lines.append(f"  Entry:  {_fmt(entry)}")
-        lines.append(f"  Exit:   {exit_price:.2f}")
-        lines.append(f"  P&L:    {pnl_arrow} {pnl_pts}  {pnl_pct}")
+        lines.append(section("📍 SPOT P&L"))
+        lines.append(f"  Entry:  {price(entry)}")
+        lines.append(f"  Exit:   {price(exit_price)}")
+        lines.append(f"  P&L:    {pnl_line}  {pnl_pct}")
         if stop and target:
             rr = _risk_reward_label(entry or exit_price, stop, target)
-            lines.append(f"  R:R was: {rr}  |  SL {_fmt(stop)} / Tgt {_fmt(target)}")
+            lines.append(
+                f"  R:R was: {rr}  |  SL {price(stop)} / Tgt {price(target)}"
+            )
 
         if option_q:
             lines.append("")
-            lines.append(f"🎯 OPTION  •  {option_q.trading_symbol}")
-            lines.append(f"  Expiry: {option_q.expiry}")
+            lines.append(section(f"🎯 OPTION  •  {html_escape(option_q.trading_symbol)}"))
+            lines.append(f"  Expiry: {bold(html_escape(option_q.expiry))}")
             if ask:
-                lines.append(f"  Entry ask was: ₹{ask:.2f}")
-                lines.append(f"  SL level was:  {prem_sl}  |  Target was: {prem_tgt}")
-                lines.append("  → Check current LTP in broker app to book P&L")
-            else:
-                lines.append("  → Check current LTP in broker app to book P&L")
+                lines.append(f"  Entry ask was: {bold(f'₹{ask:.2f}')}")
+            lines.append(
+                f"  → {bold('Exit triggered by SPOT')} — book option at market in broker app"
+            )
 
         lines.append("")
-        lines.append(f"📋 Reason: {event.reason}")
+        lines.append(f"📋 Reason: {html_escape(event.reason)}")
 
         return "\n".join(lines)
 
     @staticmethod
-    def _fmt_squareoff(event: SignalEvent, extra: dict,
-                       option_q: OptionQuote | None,
-                       rr_ratio: float, strike_mode: str) -> str:
+    def _fmt_squareoff(
+        event: SignalEvent,
+        extra: dict,
+        option_q: OptionQuote | None,
+        rr_ratio: float,
+        strike_mode: str,
+        bar_time_is_open: bool = True,
+    ) -> str:
         entry      = extra.get("entry")
         exit_price = event.price
         is_ce      = (event.side == "CE")
 
         if entry is not None:
-            spot_pnl  = (exit_price - entry) if is_ce else (entry - exit_price)
-            pnl_pts   = f"{spot_pnl:+.1f} pts"
-            pnl_arrow = "🟢" if spot_pnl > 0 else "🔴"
+            spot_pnl = (exit_price - entry) if is_ce else (entry - exit_price)
+            pnl_line = pts_signed(spot_pnl)
         else:
-            pnl_pts   = "—"
-            pnl_arrow = "⚪"
+            pnl_line = "—"
 
         ask = option_q.entry_ask() if option_q else extra.get("option_ask")
-        prem_sl, prem_tgt = _pnl_premium(ask, rr=rr_ratio)
 
-        lines = ["⏹ SQUARE OFF  •  EOD EXIT"]
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        lines.append(f"⏰ {event.timestamp.strftime('%H:%M IST')}  |  15:15 forced exit")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines = [f"⏹ {bold('SQUARE OFF')}  •  EOD EXIT"]
+        lines.append(DIVIDER)
+        lines.append(
+            f"⏰ Bar close: {bold(_bar_close_label(event.timestamp, bar_time_is_open=bar_time_is_open))}"
+            f"  |  {bold('15:15 forced exit')}"
+        )
+        lines.append(DIVIDER)
 
-        lines.append("📍 SPOT P&L")
-        lines.append(f"  Entry: {_fmt(entry)}  →  Exit: {exit_price:.2f}")
-        lines.append(f"  P&L:   {pnl_arrow} {pnl_pts}")
+        lines.append(section("📍 SPOT P&L"))
+        lines.append(f"  Entry: {price(entry)}  →  Exit: {price(exit_price)}")
+        lines.append(f"  P&L:   {pnl_line}")
 
         lines.append("")
-        lines.append("⚠️  Close your option position NOW in broker app")
+        lines.append(f"⚠️  {bold('Close your option position NOW')} in broker app")
 
         if option_q:
             lines.append("")
-            lines.append(f"🎯 OPTION  •  {option_q.trading_symbol}")
-            lines.append(f"  Expiry: {option_q.expiry}")
+            lines.append(section(f"🎯 OPTION  •  {html_escape(option_q.trading_symbol)}"))
+            lines.append(f"  Expiry: {bold(html_escape(option_q.expiry))}")
             if ask:
-                lines.append(f"  Entry ask was: ₹{ask:.2f}")
-                lines.append(f"  SL ref: {prem_sl}  |  Target ref: {prem_tgt}")
-            lines.append("  → Sell at current market price immediately")
+                lines.append(f"  Entry ask was: {bold(f'₹{ask:.2f}')}")
+            lines.append(
+                f"  → {bold('Sell at market')} — EOD square-off follows spot exit"
+            )
 
         return "\n".join(lines)

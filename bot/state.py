@@ -72,6 +72,7 @@ class LiveMonitorState:
     last_processed_candle: str | None = None
     or_alert_sent: bool = False
     dispatched_alert_keys: list[str] = field(default_factory=list)
+    dispatched_early_watch_keys: list[str] = field(default_factory=list)
     last_data_warning_at: str | None = None
     entry_window_seen_without_bars: str | None = None
     signals_paused_alert_sent: bool = False
@@ -106,6 +107,7 @@ class LiveMonitorState:
             "last_processed_candle": self.last_processed_candle,
             "or_alert_sent": self.or_alert_sent,
             "dispatched_alert_keys": list(self.dispatched_alert_keys),
+            "dispatched_early_watch_keys": list(self.dispatched_early_watch_keys),
             "last_data_warning_at": self.last_data_warning_at,
             "entry_window_seen_without_bars": self.entry_window_seen_without_bars,
             "signals_paused_alert_sent": self.signals_paused_alert_sent,
@@ -123,6 +125,7 @@ class LiveMonitorState:
             last_processed_candle=raw.get("last_processed_candle"),
             or_alert_sent=bool(raw.get("or_alert_sent", False)),
             dispatched_alert_keys=list(raw.get("dispatched_alert_keys", [])),
+            dispatched_early_watch_keys=list(raw.get("dispatched_early_watch_keys", [])),
             last_data_warning_at=raw.get("last_data_warning_at"),
             entry_window_seen_without_bars=raw.get("entry_window_seen_without_bars"),
             signals_paused_alert_sent=bool(raw.get("signals_paused_alert_sent", False)),

@@ -12,7 +12,8 @@ from bot.alerts import TelegramAlerter
 from bot.combined import process_session_bar
 from bot.config import AUTO_TRADE, AppConfig, StrategyConfig
 from bot.day_router import ensure_day_mode
-from bot.data_feed import DataFeedError, fetch_with_retry, is_bar_complete, is_data_stale
+from bot.data_feed import DataFeedError, FeedSnapshot, fetch_with_retry, is_bar_complete, is_data_stale
+from bot.early_watch import detect_early_or_watch, early_watch_key
 from bot.indicators import or_width
 from bot.logger import LiveEventLogger, ReplayLogger, SignalEvent
 from bot.state import LiveMonitorState, Position, make_day_state
@@ -61,6 +62,16 @@ def in_signal_window(now: datetime, cfg: StrategyConfig) -> bool:
     or_end = open_m + cfg.or_minutes
     square_off = cfg.square_off_h * 60 + cfg.square_off_m
     return or_end <= m < square_off
+
+
+def can_manual_start_session(now: datetime, cfg: StrategyConfig) -> bool:
+    """True when /start may launch the market session (from 09:10 IST through monitor stop)."""
+    if after_monitor_close(now, cfg):
+        return False
+    m = now.hour * 60 + now.minute
+    prep_start = cfg.market_open_h * 60 + cfg.market_open_m - 5
+    stop_m = cfg.monitor_stop_h * 60 + cfg.monitor_stop_m
+    return prep_start <= m <= stop_m
 
 
 def should_send_data_warning(
@@ -207,6 +218,72 @@ class LiveScheduler:
             f"No bars processed for {SIGNALS_PAUSED_AFTER_MIN}+ min during signal window",
         )
 
+    def _maybe_early_or_watch(
+        self,
+        monitor: LiveMonitorState,
+        snapshot: FeedSnapshot,
+        now: datetime,
+        session_date: str,
+        *,
+        catch_up_mode: bool,
+    ) -> None:
+        if not self.cfg.enable_early_or_watch or catch_up_mode:
+            return
+        if not in_signal_window(now, self.cfg.strategy):
+            return
+        if monitor.day is None or not monitor.day.or_defined:
+            return
+        if monitor.position.side.value != "FLAT":
+            return
+
+        today_df = snapshot.dataframe[snapshot.dataframe["session_date"] == session_date]
+        if today_df.empty:
+            return
+
+        row = snapshot.dataframe.loc[today_df.index[-1]]
+        bar_open = row["timestamp"].to_pydatetime()
+        if is_bar_complete(
+            bar_open,
+            now,
+            bar_time_is_open=self.cfg.strategy.bar_time_is_open,
+            buffer_sec=self.cfg.candle_close_buffer_sec,
+        ):
+            return
+
+        vwap = float(row["vwap"]) if pd.notna(row.get("vwap")) else None
+        adx = float(row["adx"]) if pd.notna(row.get("adx")) else None
+        watch = detect_early_or_watch(
+            monitor.day,
+            monitor.position,
+            float(row["close"]),
+            vwap,
+            adx,
+            self.cfg.strategy,
+        )
+        if watch is None:
+            return
+
+        key = early_watch_key(session_date, watch, bar_open)
+        if key in monitor.dispatched_early_watch_keys:
+            return
+
+        monitor.dispatched_early_watch_keys.append(key)
+        self.alerter.or_break_pending(
+            watch,
+            float(row["close"]),
+            monitor.day.or_high or 0.0,
+            monitor.day.or_low or 0.0,
+            bar_open,
+            now=now,
+            vwap=vwap,
+            adx=adx,
+            bar_time_is_open=self.cfg.strategy.bar_time_is_open,
+        )
+        self.event_log.log_system(
+            watch,
+            f"Forming bar {bar_open.isoformat()} spot={float(row['close']):.2f}",
+        )
+
     def process_tick(self) -> None:
         if AUTO_TRADE or self.cfg.auto_trade:
             raise RuntimeError("AUTO_TRADE must remain False")
@@ -319,6 +396,10 @@ class LiveScheduler:
                         f"OR {monitor.day.or_high}/{monitor.day.or_low} width={width:.2f} mode={mode_str}",
                     )
 
+        self._maybe_early_or_watch(
+            monitor, snapshot, now, session_date, catch_up_mode=catch_up_mode,
+        )
+
         self._track_signals_paused(monitor, now, bars_processed)
         monitor.save(self.cfg.state_file)
         if catch_up_mode:
@@ -328,6 +409,16 @@ class LiveScheduler:
             self.event_log.log_system("CATCH_UP", f"Catch-up complete {detail}")
         if new_events:
             self._dispatch_events(new_events, replay.position)
+
+    def _sleep_until_next_poll(self) -> None:
+        """Sleep until poll interval elapses, waking early when /tick is requested."""
+        from bot.telegram_commands import TelegramCommandHandler
+
+        deadline = time.monotonic() + self.cfg.poll_interval_sec
+        while time.monotonic() < deadline:
+            if TelegramCommandHandler.force_tick_requested():
+                return
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
     def run_forever(self) -> None:
         from bot.telegram_commands import TelegramCommandHandler
@@ -346,7 +437,7 @@ class LiveScheduler:
             finally:
                 if force_tick:
                     TelegramCommandHandler.clear_force_tick()
-            time.sleep(self.cfg.poll_interval_sec)
+            self._sleep_until_next_poll()
 
     def stop(self) -> None:
         self._running = False

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -14,7 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from bot.alerts import TelegramAlerter, _urlopen
-from bot.config import AppConfig, load_combined_config
+from bot.config import AppConfig
 from bot.platform_paths import (
     default_market_session_script,
     popen_session_kwargs,
@@ -22,16 +23,35 @@ from bot.platform_paths import (
     session_start_command,
     terminate_process,
 )
-from bot.scheduler import after_monitor_close, in_monitor_window, in_signal_window
-from bot.state import LiveMonitorState, PositionSide
+from bot.scheduler import after_monitor_close, can_manual_start_session
+from bot.telegram_status import (
+    TodayContext,
+    format_health,
+    format_levels,
+    format_next,
+    format_or,
+    format_ping,
+    format_position,
+    format_status,
+    format_today,
+    load_today_context,
+    probe_market_feed,
+)
 
 FORCE_TICK_FLAG = Path("data/live/force_tick.request")
 DEFAULT_OFFSET_FILE = Path("data/live/telegram_offset.json")
 DEFAULT_LOCK_FILE = Path("data/live/market-session.lock")
+DEFAULT_REMOTE_LOCK_FILE = Path("data/live/telegram-remote.lock")
 DEFAULT_SESSION_LOG = Path("data/live/market-session.log")
 DEFAULT_START_SCRIPT = default_market_session_script()
+SESSION_START_WAIT_SEC = 15
+RESTART_WAIT_SEC = 3
 
-KNOWN_COMMANDS = frozenset({"start", "stop", "status", "help", "tick"})
+COMMAND_ALIASES = {"pos": "position"}
+KNOWN_COMMANDS = frozenset({
+    "start", "stop", "status", "help", "tick",
+    "ping", "health", "or", "position", "today", "levels", "next", "restart",
+})
 
 
 @dataclass(frozen=True)
@@ -52,6 +72,7 @@ def parse_command(text: str) -> ParsedCommand | None:
     if not parts:
         return None
     name = parts[0].lower()
+    name = COMMAND_ALIASES.get(name, name)
     if name not in KNOWN_COMMANDS:
         return None
     return ParsedCommand(name=name, args=tuple(parts[1:]))
@@ -63,6 +84,18 @@ def is_authorized(chat_id: int | str, cfg: AppConfig) -> bool:
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
+
+
+def _remote_listener_pid(remote_lock: Path = DEFAULT_REMOTE_LOCK_FILE) -> int | None:
+    """Return PID of the always-on Telegram remote listener, if running."""
+    path = _project_root() / remote_lock
+    if not path.exists():
+        return None
+    try:
+        pid = int(path.read_text(encoding="utf-8").strip())
+    except ValueError:
+        return None
+    return pid if process_exists(pid) else None
 
 
 class SessionProcessControl:
@@ -118,7 +151,15 @@ class SessionProcessControl:
             stderr=subprocess.DEVNULL,
             **popen_session_kwargs(),  # type: ignore[arg-type]
         )
-        return "Starting market session… You should get a startup Telegram within ~30s."
+        for _ in range(SESSION_START_WAIT_SEC):
+            if self.is_running():
+                pid = self.running_pid()
+                return f"Market session started (pid {pid}). Startup Telegram within ~30s."
+            time.sleep(1)
+        return (
+            "Start command sent — session lock not seen yet.\n"
+            "Send /status again in ~30s (check data/live/market-session.log if still stopped)."
+        )
 
     def stop(self) -> str:
         pid = self.running_pid()
@@ -217,13 +258,37 @@ class TelegramCommandHandler:
             text = message.get("text") or ""
             cmd = parse_command(text)
             if cmd is None:
+                if text.strip().startswith("/"):
+                    self.alerter.send("Unknown command. Send /help for the list.")
+                elif text.strip():
+                    self.alerter.send("Commands start with /. Try /help")
                 continue
             self._dispatch(cmd)
             handled += 1
         self.updates.acknowledge(updates)
         return handled
 
+    def _today_context(self) -> TodayContext:
+        state_path = _project_root() / self.cfg.state_file
+        return load_today_context(
+            self.cfg,
+            state_path,
+            now=datetime.now(self.zone),
+            market_pid=self.process.running_pid(),
+            remote_pid=_remote_listener_pid(),
+        )
+
+    def _signals_csv_path(self) -> Path:
+        path = self.cfg.event_log_csv
+        return path if path.is_absolute() else _project_root() / path
+
     def _dispatch(self, cmd: ParsedCommand) -> None:
+        try:
+            self._dispatch_inner(cmd)
+        except Exception as exc:
+            self.alerter.send(f"Command failed ({cmd.name}): {type(exc).__name__}")
+
+    def _dispatch_inner(self, cmd: ParsedCommand) -> None:
         if cmd.name == "help":
             self.alerter.send(self._help_text())
             return
@@ -237,11 +302,11 @@ class TelegramCommandHandler:
                     "Bot auto-starts tomorrow at 09:10."
                 )
                 return
-            if not in_monitor_window(now, cfg):
+            if not can_manual_start_session(now, cfg):
                 self.alerter.send(
-                    "⏳ Too early — market not open yet\n"
-                    "Monitoring starts 09:15 IST.\n"
-                    "Bot auto-starts at 09:10; signals from 09:30."
+                    "⏳ Too early — manual start from 09:10 IST\n"
+                    "Monitoring runs 09:15–15:30; signals from 09:30.\n"
+                    "Scheduled task also auto-starts at 09:10."
                 )
                 return
             self.alerter.send(self.process.start())
@@ -254,120 +319,84 @@ class TelegramCommandHandler:
             return
         if cmd.name == "tick":
             self.alerter.send(self._request_tick())
+            return
+        if cmd.name == "ping":
+            self.alerter.send(format_ping(self._today_context()))
+            return
+        if cmd.name == "health":
+            ctx = self._today_context()
+            probe = probe_market_feed(self.cfg, ctx.now)
+            self.alerter.send(format_health(ctx, self.cfg, probe, self._signals_csv_path()))
+            return
+        if cmd.name == "or":
+            self.alerter.send(format_or(self._today_context(), self.cfg))
+            return
+        if cmd.name == "position":
+            ctx = self._today_context()
+            probe = probe_market_feed(self.cfg, ctx.now)
+            self.alerter.send(format_position(ctx, self.cfg, probe))
+            return
+        if cmd.name == "today":
+            ctx = self._today_context()
+            self.alerter.send(format_today(ctx, self.cfg, self._signals_csv_path()))
+            return
+        if cmd.name == "levels":
+            ctx = self._today_context()
+            probe = probe_market_feed(self.cfg, ctx.now)
+            self.alerter.send(format_levels(ctx, self.cfg, probe))
+            return
+        if cmd.name == "next":
+            self.alerter.send(format_next(self._today_context(), self.cfg))
+            return
+        if cmd.name == "restart":
+            self.alerter.send(self._restart_session())
+            return
 
     def _help_text(self) -> str:
         return (
             "📟 NIFTY Signal Engine — remote commands\n"
-            "/start — start market session (09:15–15:30 IST only)\n"
+            "\n"
+            "Session\n"
+            "/start — start market session (from 09:10 IST)\n"
             "/stop — stop running session\n"
-            "/status — bot state, position, last candle\n"
-            "/tick — force one signal poll (~20s, session must be running)\n"
+            "/restart — stop, wait, then start again\n"
+            "/status — full bot state snapshot\n"
+            "\n"
+            "Market\n"
+            "/or — opening range, mode, breakout lines\n"
+            "/position (/pos) — open trade only\n"
+            "/today — today's signals from log\n"
+            "/levels — spot vs OR distances\n"
+            "/next — next 5m bar close time\n"
+            "\n"
+            "Debug\n"
+            "/ping — remote alive check\n"
+            "/health — diagnostics (remote, bot, feed, errors)\n"
+            "/tick — force immediate signal poll\n"
             "/help — this message"
         )
 
     def _status_text(self) -> str:
+        return format_status(self._today_context(), self.cfg)
+
+    def _restart_session(self) -> str:
         now = datetime.now(self.zone)
-        pid = self.process.running_pid()
-        running = pid is not None
-
-        # ── Time & session state ──────────────────────────────────────────
-        in_window = in_monitor_window(now, self.cfg.strategy)
-        in_sig = in_signal_window(now, self.cfg.strategy)
-        time_str = now.strftime("%d %b %Y  %H:%M IST")
-
-        if running:
-            session_status = f"🟢 RUNNING (pid {pid})"
-        elif in_window:
-            session_status = "🔴 STOPPED  ⚠️ market is open — use /start"
-        else:
-            session_status = "⚪ STOPPED (outside market hours)"
-
-        if in_sig:
-            window_status = "🟡 SIGNAL WINDOW OPEN"
-        elif in_window:
-            cfg = self.cfg.strategy
-            sig_open = f"{cfg.market_open_h:02d}:{cfg.market_open_m + cfg.or_minutes:02d}"
-            window_status = f"⏳ Waiting for OR  (signals from {sig_open})"
-        else:
-            window_status = "💤 Market closed  (next: Mon–Fri 09:10)"
-
-        lines = [
-            "📟 NIFTY Signal Engine",
-            f"🕐 {time_str}",
-            f"Bot:    {session_status}",
-            f"Window: {window_status}",
-        ]
-
-        # ── State file ────────────────────────────────────────────────────
-        state_path = _project_root() / self.cfg.state_file
-        session_date = now.date().isoformat()
-        if state_path.exists():
-            monitor = LiveMonitorState.load(state_path, session_date)
-            pos = monitor.position
-            day = monitor.day
-
-            # Last processed candle — human readable
-            if monitor.last_processed_candle:
-                try:
-                    from datetime import datetime as _dt
-                    lpc = _dt.fromisoformat(monitor.last_processed_candle)
-                    lpc_str = lpc.strftime("%H:%M IST")
-                except Exception:
-                    lpc_str = monitor.last_processed_candle
-            else:
-                lpc_str = "—  (no bars processed yet)"
-            lines.append(f"Last bar: {lpc_str}")
-
-            combined = self.cfg.combined or load_combined_config(self.cfg.strategy)
-
-            # Opening range
-            if day and day.or_defined:
-                or_width = round((day.or_high or 0) - (day.or_low or 0), 2)
-                lines.append(
-                    f"OR:       H {day.or_high:.2f}  /  L {day.or_low:.2f}  "
-                    f"(width {or_width:.0f} pts)"
-                )
-            else:
-                lines.append("OR:       Not defined yet")
-
-            if day and day.day_mode:
-                mode_label = day.day_mode
-                if day.day_mode == "J_PLUS" and not combined.enable_j_plus:
-                    mode_label = "J+ disabled (no entries)"
-                lines.append(f"Mode:     {mode_label}")
-
-            # Today's trades
-            if day:
-                t = day.trades_today
-                max_trades = (
-                    combined.j_trap.max_trades_day
-                    if day.day_mode == "J_PLUS"
-                    else self.cfg.strategy.max_trades_per_day
-                )
-                fired = []
-                if day.fired_long_today:
-                    fired.append("CE")
-                if day.fired_short_today:
-                    fired.append("PE")
-                fired_str = " + ".join(fired) if fired else "none"
-                lines.append(f"Trades:   {t}/{max_trades} today  ({fired_str})")
-
-            # Current position
-            if pos.side != PositionSide.FLAT:
-                opt = f"  [{pos.option_symbol}]" if pos.option_symbol else ""
-                lines.append(
-                    f"Position: {pos.side.value}{opt}\n"
-                    f"          Entry {pos.entry_price:.2f}  "
-                    f"SL {pos.stop:.2f}  "
-                    f"T {pos.target:.2f}"
-                )
-            else:
-                lines.append("Position: FLAT")
-
-        else:
-            lines.append("State:    No data yet for today")
-
-        return "\n".join(lines)
+        cfg = self.cfg.strategy
+        if after_monitor_close(now, cfg):
+            return (
+                "⏸ Market session is closed for today\n"
+                "Monitoring: 09:15–15:30 IST (Mon–Fri).\n"
+                "Bot auto-starts tomorrow at 09:10."
+            )
+        if not can_manual_start_session(now, cfg):
+            return (
+                "⏳ Too early — manual restart from 09:10 IST\n"
+                "Monitoring runs 09:15–15:30; signals from 09:30."
+            )
+        stop_msg = self.process.stop()
+        time.sleep(RESTART_WAIT_SEC)
+        start_msg = self.process.start()
+        return f"Restart:\n1) {stop_msg}\n2) {start_msg}"
 
     def _request_tick(self) -> str:
         if not self.process.is_running():
@@ -375,7 +404,7 @@ class TelegramCommandHandler:
         path = _project_root() / self.force_tick_flag
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(datetime.now(self.zone).isoformat(), encoding="utf-8")
-        return "Tick requested — bot will process on next poll (~20s)."
+        return "Tick requested — polling within ~2s (wake from sleep)."
 
     @staticmethod
     def force_tick_requested(flag_path: Path = FORCE_TICK_FLAG) -> bool:
@@ -401,7 +430,7 @@ def run_remote_loop(cfg: AppConfig, alerter: TelegramAlerter, poll_interval_sec:
     try:
         handler.alerter.send(
             "📟 Remote control online\n"
-            "Send /help for commands (/start, /stop, /status, /tick)."
+            "Send /help for all commands."
         )
     except Exception:
         pass  # Don't die if Telegram is unreachable at startup

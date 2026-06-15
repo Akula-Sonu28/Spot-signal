@@ -22,6 +22,19 @@ StrikeMode = Literal["ATM", "ITM1", "ATM_OR_ITM1"]
 
 # Manual option execution: buy at ask; SL = 50% premium loss (Pine v3.7 guidance).
 PREMIUM_SL_LOSS_FRAC = 0.5
+NIFTY_LOT_SIZE = 75
+OPTION_GREEK_URL = "https://api.upstox.com/v3/market-quote/option-greek"
+# NSE cash session 09:15–15:30 — used to scale Upstox theta (₹/day per share).
+TRADING_MINUTES_PER_DAY = 375
+
+
+@dataclass(frozen=True)
+class OptionGreeks:
+    delta: float
+    theta: float | None = None
+    iv: float | None = None
+    gamma: float | None = None
+    vega: float | None = None
 
 
 @dataclass(frozen=True)
@@ -36,6 +49,11 @@ class OptionQuote:
     ask: float | None = None
     spread: float | None = None
     oi: float | None = None
+    delta: float | None = None
+    theta: float | None = None
+    iv: float | None = None
+    gamma: float | None = None
+    vega: float | None = None
     quote_ok: bool = False
     note: str = ""
 
@@ -58,6 +76,16 @@ class OptionQuote:
             "option_oi": self.oi,
             "option_note": self.note,
         }
+        if self.delta is not None:
+            extra["option_delta"] = self.delta
+        if self.theta is not None:
+            extra["option_theta"] = self.theta
+        if self.iv is not None:
+            extra["option_iv"] = self.iv
+        if self.gamma is not None:
+            extra["option_gamma"] = self.gamma
+        if self.vega is not None:
+            extra["option_vega"] = self.vega
         levels = compute_premium_levels(self.entry_ask())
         if levels:
             extra["option_premium_sl"], extra["option_premium_target"] = levels
@@ -157,6 +185,185 @@ def _parse_bid_ask(quote: dict) -> tuple[float | None, float | None]:
     return bid, ask
 
 
+def _fetch_option_greeks(instrument_key: str, token: str) -> OptionGreeks | None:
+    """Return option greeks from Upstox (delta, theta, IV, gamma, vega)."""
+    if not instrument_key or not token:
+        return None
+    key = _encode_key(instrument_key)
+    url = f"{OPTION_GREEK_URL}?instrument_key={key}"
+    try:
+        payload = _http_json(url, token=token)
+        if payload.get("status") != "success":
+            return None
+        data = payload.get("data") or {}
+        if not data:
+            return None
+        row = next(iter(data.values()))
+        delta = row.get("delta")
+        if delta is None:
+            return None
+        return OptionGreeks(
+            delta=float(delta),
+            theta=float(row["theta"]) if row.get("theta") is not None else None,
+            iv=float(row["iv"]) if row.get("iv") is not None else None,
+            gamma=float(row["gamma"]) if row.get("gamma") is not None else None,
+            vega=float(row["vega"]) if row.get("vega") is not None else None,
+        )
+    except (urllib.error.HTTPError, TypeError, ValueError):
+        return None
+
+
+def _format_iv_pct(iv: float | None) -> str:
+    if iv is None:
+        return "—"
+    pct = iv * 100.0 if iv <= 2.0 else iv
+    return f"{pct:.1f}%"
+
+
+def estimate_hold_minutes(
+    spot_distance: float,
+    atr: float | None,
+    *,
+    floor: int = 15,
+    cap: int = 150,
+) -> int:
+    """Rough minutes until spot travels *spot_distance* at current ATR pace."""
+    if atr is None or atr <= 0:
+        return 60
+    bars = max(1, round(abs(spot_distance) / atr))
+    return int(min(cap, max(floor, bars * 5)))
+
+
+def estimate_premium_change(
+    *,
+    spot_entry: float,
+    spot_exit: float,
+    delta: float | None,
+    theta: float | None = None,
+    gamma: float | None = None,
+    hold_minutes: int = 60,
+    trading_minutes_per_day: int = TRADING_MINUTES_PER_DAY,
+) -> float | None:
+    """
+    Estimate Δpremium per share: δ·ΔS + θ·(hold/session) + ½γ·ΔS².
+
+    Theta from Upstox is treated as ₹/share per trading day. IV/vega are not
+    projected (IV path unknown at entry).
+    """
+    if delta is None:
+        return None
+    dS = spot_exit - spot_entry
+    change = delta * dS
+    if gamma is not None:
+        change += 0.5 * gamma * dS * dS
+    if theta is not None:
+        change += theta * (hold_minutes / trading_minutes_per_day)
+    return change
+
+
+def spot_pnl_points(entry: float, level: float | None, side: str) -> float | None:
+    """Signed spot P&L in index points if price reaches *level*."""
+    if level is None:
+        return None
+    if side == "CE":
+        return level - entry
+    return entry - level
+
+
+def estimate_premium_pnl_per_share(
+    delta: float | None,
+    spot_entry: float,
+    spot_level: float | None,
+) -> float | None:
+    """Δpremium ≈ delta × Δspot (legacy δ-only helper)."""
+    if delta is None or spot_level is None:
+        return None
+    return estimate_premium_change(
+        spot_entry=spot_entry,
+        spot_exit=spot_level,
+        delta=delta,
+    )
+
+
+from bot.telegram_format import bold, italic, pts_signed, rupee_signed, section
+
+
+def format_entry_pnl_lines(
+    *,
+    entry: float,
+    stop: float | None,
+    target: float | None,
+    side: str,
+    delta: float | None = None,
+    theta: float | None = None,
+    iv: float | None = None,
+    gamma: float | None = None,
+    atr: float | None = None,
+    lot_size: int = NIFTY_LOT_SIZE,
+) -> list[str]:
+    """Spot P&L at SL/target plus greek-based premium estimate."""
+    tgt_pts = spot_pnl_points(entry, target, side)
+    sl_pts = spot_pnl_points(entry, stop, side)
+    if tgt_pts is None and sl_pts is None:
+        return []
+
+    lines = [section("📊 P&L IF SPOT LEVELS HIT")]
+    if tgt_pts is not None and sl_pts is not None:
+        asym = ""
+        if abs(sl_pts) > abs(tgt_pts) * 1.25:
+            asym = f"  {italic('spot SL wider than target — OR stop')}"
+        lines.append(
+            f"  Target: {pts_signed(tgt_pts)} spot  |  "
+            f"SL: {pts_signed(sl_pts)} spot{asym}"
+        )
+    elif tgt_pts is not None:
+        lines.append(f"  Target: {pts_signed(tgt_pts)} spot")
+    elif sl_pts is not None:
+        lines.append(f"  SL: {pts_signed(sl_pts)} spot")
+
+    if delta is not None:
+        greek_bits = [bold(f"δ={delta:+.2f}")]
+        if theta is not None:
+            greek_bits.append(bold(f"θ={theta:+.1f}/day"))
+        if iv is not None:
+            greek_bits.append(bold(f"IV={_format_iv_pct(iv)}"))
+        if gamma is not None:
+            greek_bits.append(bold(f"γ={gamma:.4f}"))
+        lines.append(f"  Greeks: {'  '.join(greek_bits)}")
+
+        if target is not None and stop is not None:
+            hold_tgt = estimate_hold_minutes(abs(entry - target), atr)
+            hold_sl = min(estimate_hold_minutes(abs(entry - stop), atr), 45)
+            tgt_prem = estimate_premium_change(
+                spot_entry=entry,
+                spot_exit=target,
+                delta=delta,
+                theta=theta,
+                gamma=gamma,
+                hold_minutes=hold_tgt,
+            )
+            sl_prem = estimate_premium_change(
+                spot_entry=entry,
+                spot_exit=stop,
+                delta=delta,
+                theta=theta,
+                gamma=gamma,
+                hold_minutes=hold_sl,
+            )
+            if tgt_prem is not None and sl_prem is not None:
+                lines.append(
+                    f"  {bold('Premium est.')} (δ+θ+½γΔS², IV flat): "
+                    f"Tgt ~{rupee_signed(tgt_prem)}/sh (~{rupee_signed(tgt_prem * lot_size)}/lot) "
+                    f"@~{bold(str(hold_tgt))}m  |  "
+                    f"SL ~{rupee_signed(sl_prem)}/sh (~{rupee_signed(sl_prem * lot_size)}/lot) "
+                    f"@~{bold(str(hold_sl))}m"
+                )
+                lines.append(
+                    f"  {italic('Still an estimate — exit on spot SL/target; IV can shift vega P&L')}"
+                )
+    return lines
+
+
 def lookup_option(
     spot: float,
     option_type: OptionSide,
@@ -201,6 +408,8 @@ def lookup_option(
     if spread is not None and spread > 2.0:
         note = f"Wide spread ({spread:.2f}) — check liquidity"
 
+    greeks = _fetch_option_greeks(inst["instrument_key"], token)
+
     return OptionQuote(
         strike=strike,
         option_type=option_type,
@@ -212,6 +421,11 @@ def lookup_option(
         ask=ask,
         spread=spread,
         oi=float(oi) if oi is not None else None,
+        delta=greeks.delta if greeks else None,
+        theta=greeks.theta if greeks else None,
+        iv=greeks.iv if greeks else None,
+        gamma=greeks.gamma if greeks else None,
+        vega=greeks.vega if greeks else None,
         quote_ok=True,
         note=note,
     )
