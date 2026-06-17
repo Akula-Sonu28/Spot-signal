@@ -6,14 +6,14 @@ import argparse
 import signal
 import sys
 
-from bot.alerts import TelegramAlerter
+from bot.alerts import create_alerter
 from bot.config import AUTO_TRADE, LOCKED_STRATEGY_VERSION, load_app_config, validate_app_config
 from bot.logger import LiveEventLogger
 from bot.scheduler import LiveScheduler
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="NIFTY Spot Signal Engine — live Telegram alerts")
+    parser = argparse.ArgumentParser(description="NIFTY Spot Signal Engine — live alerts")
     parser.add_argument("--env", default=".env", help="Path to .env file")
     parser.add_argument("--once", action="store_true", help="Run a single tick (testing)")
     args = parser.parse_args(argv)
@@ -29,7 +29,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Config error: {err}", file=sys.stderr)
         return 1
 
-    alerter = TelegramAlerter(cfg)
+    alerter = create_alerter(cfg)
     event_log = LiveEventLogger(cfg.event_log_csv)
     scheduler = LiveScheduler(cfg, alerter, event_log)
 
@@ -52,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"Live monitor started strategy=v{LOCKED_STRATEGY_VERSION} (AUTO_TRADE=False)",
             )
         except Exception as exc:
-            print(f"Failed to send startup Telegram: {exc}", file=sys.stderr)
+            print(f"Failed to send startup alert: {exc}", file=sys.stderr)
             return 1
         scheduler.process_tick()
         print("Single tick complete.")
@@ -72,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
             f"Live monitor started strategy=v{LOCKED_STRATEGY_VERSION} (AUTO_TRADE=False)",
         )
     except Exception as exc:
-        print(f"Failed to send startup Telegram: {exc}", file=sys.stderr)
+        print(f"Failed to send startup alert: {exc}", file=sys.stderr)
         return 1
 
     ran_session = False

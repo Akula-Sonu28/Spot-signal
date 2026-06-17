@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from bot.alerts import TelegramAlerter
+from bot.alerts import CompositeAlerter, NtfyAlerter, TelegramAlerter
 from bot.combined import process_session_bar
 from bot.config import AUTO_TRADE, AppConfig, StrategyConfig
 from bot.day_router import ensure_day_mode
@@ -101,7 +101,12 @@ def should_send_signals_paused_alert(
 
 
 class LiveScheduler:
-    def __init__(self, cfg: AppConfig, alerter: TelegramAlerter, event_log: LiveEventLogger) -> None:
+    def __init__(
+        self,
+        cfg: AppConfig,
+        alerter: TelegramAlerter | NtfyAlerter | CompositeAlerter,
+        event_log: LiveEventLogger,
+    ) -> None:
         self.cfg = cfg
         self.alerter = alerter
         self.event_log = event_log

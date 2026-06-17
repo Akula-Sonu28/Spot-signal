@@ -68,8 +68,10 @@ class AppConfig:
     """Live monitoring application settings (from environment)."""
 
     upstox_access_token: str
-    telegram_bot_token: str
-    telegram_chat_id: str
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    ntfy_topic: str = ""
+    ntfy_server: str = "https://ntfy.sh"
     auto_trade: bool = False
 
     strategy: StrategyConfig = StrategyConfig()
@@ -155,6 +157,8 @@ def load_app_config(env_file: str | Path | None = ".env") -> AppConfig:
     token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     tg_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    ntfy_topic = os.getenv("NTIFY_TOPIC", "").strip()
+    ntfy_server = os.getenv("NTIFY_SERVER", "https://ntfy.sh").strip() or "https://ntfy.sh"
 
     if _env_bool("AUTO_TRADE", False):
         raise RuntimeError("AUTO_TRADE must remain False in Phase 1 (alerts only).")
@@ -182,6 +186,8 @@ def load_app_config(env_file: str | Path | None = ".env") -> AppConfig:
         upstox_access_token=token,
         telegram_bot_token=tg_token,
         telegram_chat_id=tg_chat,
+        ntfy_topic=ntfy_topic,
+        ntfy_server=ntfy_server,
         auto_trade=False,
         strategy=strategy,
         combined=combined,
@@ -198,15 +204,27 @@ def load_app_config(env_file: str | Path | None = ".env") -> AppConfig:
     )
 
 
+def has_telegram_alerts(cfg: AppConfig) -> bool:
+    return bool(cfg.telegram_bot_token and cfg.telegram_chat_id)
+
+
+def has_ntfy_alerts(cfg: AppConfig) -> bool:
+    return bool(cfg.ntfy_topic)
+
+
 def validate_app_config(cfg: AppConfig) -> list[str]:
     """Return list of missing/invalid settings (empty = OK)."""
     errors: list[str] = []
     if not cfg.upstox_access_token:
         errors.append("UPSTOX_ACCESS_TOKEN is required")
-    if not cfg.telegram_bot_token:
-        errors.append("TELEGRAM_BOT_TOKEN is required")
-    if not cfg.telegram_chat_id:
-        errors.append("TELEGRAM_CHAT_ID is required")
+    if cfg.telegram_bot_token and not cfg.telegram_chat_id:
+        errors.append("TELEGRAM_CHAT_ID is required when TELEGRAM_BOT_TOKEN is set")
+    if cfg.telegram_chat_id and not cfg.telegram_bot_token:
+        errors.append("TELEGRAM_BOT_TOKEN is required when TELEGRAM_CHAT_ID is set")
+    if not has_telegram_alerts(cfg) and not has_ntfy_alerts(cfg):
+        errors.append(
+            "Set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID and/or NTIFY_TOPIC for alerts"
+        )
     if cfg.auto_trade or AUTO_TRADE is not False:
         errors.append("AUTO_TRADE must be False")
     return errors

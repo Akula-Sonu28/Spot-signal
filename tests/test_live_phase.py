@@ -36,7 +36,17 @@ def test_validate_app_config_missing():
         telegram_chat_id="",
     )
     errors = validate_app_config(cfg)
-    assert len(errors) == 3
+    assert len(errors) == 2
+    assert any("UPSTOX" in e for e in errors)
+    assert any("NTIFY_TOPIC" in e for e in errors)
+
+
+def test_validate_app_config_ntfy_only():
+    cfg = AppConfig(
+        upstox_access_token="token",
+        ntfy_topic="my-topic",
+    )
+    assert validate_app_config(cfg) == []
 
 
 def test_bar_complete_waits_for_buffer():

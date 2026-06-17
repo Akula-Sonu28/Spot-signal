@@ -1,4 +1,4 @@
-"""Telegram notifications for live signal monitoring."""
+"""Live signal notifications (Telegram, ntfy, or both)."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ def _urlopen(req: urllib.request.Request, timeout: int = 20):  # type: ignore[re
         return urllib.request.urlopen(req, timeout=timeout, context=ctx)
 
 
-from bot.config import LOCKED_STRATEGY_VERSION, AppConfig
+from bot.config import LOCKED_STRATEGY_VERSION, AppConfig, has_ntfy_alerts, has_telegram_alerts
 from bot.early_watch import bar_close_time
 from bot.logger import SignalEvent
 from bot.option_lookup import OptionQuote, PREMIUM_SL_LOSS_FRAC, format_entry_pnl_lines
@@ -50,6 +50,7 @@ from bot.telegram_format import (
     bold,
     code,
     html_escape,
+    html_to_plain,
     italic,
     price,
     pts_signed,
@@ -585,3 +586,66 @@ class TelegramAlerter:
             )
 
         return "\n".join(lines)
+
+
+class NtfyAlerter(TelegramAlerter):
+    """Push alerts via ntfy.sh (plain text, same message content as Telegram)."""
+
+    def __init__(self, cfg: AppConfig) -> None:
+        self.cfg = cfg
+        topic = urllib.parse.quote(cfg.ntfy_topic, safe="")
+        self._url = f"{cfg.ntfy_server.rstrip('/')}/{topic}"
+
+    def send(self, text: str, *, parse_mode: str | None = None) -> None:
+        body = html_to_plain(text) if parse_mode else text
+        title = body.split("\n", 1)[0][:200]
+        url = f"{self._url}?{urllib.parse.urlencode({'title': title})}"
+        headers = {"Content-Type": "text/plain; charset=utf-8"}
+        req = urllib.request.Request(
+            url,
+            data=body.encode("utf-8"),
+            method="POST",
+            headers=headers,
+        )
+        try:
+            with _urlopen(req, timeout=20) as resp:
+                if resp.status >= 400:
+                    detail = resp.read().decode(errors="replace")
+                    raise RuntimeError(f"ntfy HTTP {resp.status}: {detail}")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            raise RuntimeError(f"ntfy HTTP {exc.code}: {detail}") from exc
+
+
+class CompositeAlerter:
+    """Fan out alerts to multiple backends."""
+
+    def __init__(self, alerters: list[TelegramAlerter]) -> None:
+        self._alerters = alerters
+
+    def __getattr__(self, name: str):
+        def method(*args, **kwargs):
+            errors: list[Exception] = []
+            for alerter in self._alerters:
+                try:
+                    getattr(alerter, name)(*args, **kwargs)
+                except Exception as exc:
+                    errors.append(exc)
+            if len(errors) == len(self._alerters):
+                raise errors[-1]
+
+        return method
+
+
+def create_alerter(cfg: AppConfig) -> TelegramAlerter | CompositeAlerter:
+    """Build the configured alert backend(s)."""
+    alerters: list[TelegramAlerter] = []
+    if has_ntfy_alerts(cfg):
+        alerters.append(NtfyAlerter(cfg))
+    if has_telegram_alerts(cfg):
+        alerters.append(TelegramAlerter(cfg))
+    if not alerters:
+        raise RuntimeError("No alert channel configured")
+    if len(alerters) == 1:
+        return alerters[0]
+    return CompositeAlerter(alerters)

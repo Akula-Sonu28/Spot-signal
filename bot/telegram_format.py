@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 
@@ -44,3 +46,18 @@ def pts_signed(value: float) -> str:
 def rupee_signed(value: float) -> str:
     sign = "+" if value >= 0 else "-"
     return f"{sign}₹{bold(f'{abs(value):.1f}')}"
+
+
+def html_unescape(text: str) -> str:
+    return (
+        text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+    )
+
+
+def html_to_plain(text: str) -> str:
+    """Strip Telegram HTML tags for plain-text channels (e.g. ntfy)."""
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    return html_unescape(text)
