@@ -41,6 +41,7 @@ def _urlopen(req: urllib.request.Request, timeout: int = 20):  # type: ignore[re
 
 
 from bot.config import LOCKED_STRATEGY_VERSION, AppConfig, has_ntfy_alerts, has_telegram_alerts
+from bot.option_truth import SPREAD_DRAG_WARN_PCT, PREMIUM_STOP_MULT, PREMIUM_TARGET_MULT
 from bot.early_watch import bar_close_time
 from bot.logger import SignalEvent
 from bot.option_lookup import OptionQuote, PREMIUM_SL_LOSS_FRAC, format_entry_pnl_lines
@@ -103,6 +104,107 @@ def _spot_exit_plan(stop: float | None, target: float | None) -> str:
 def _bar_close_label(bar_open: datetime, *, bar_time_is_open: bool = True) -> str:
     close_ts = bar_close_time(bar_open, bar_time_is_open=bar_time_is_open)
     return close_ts.strftime("%H:%M IST")
+
+
+def _spread_friction_lines(extra: dict) -> list[str]:
+    """Entry alert: high bid-ask drag and estimated slippage (option truth layer)."""
+    drag = extra.get("spread_drag_pct")
+    if drag is None:
+        return []
+    try:
+        drag_f = float(drag)
+    except (TypeError, ValueError):
+        return []
+    if drag_f <= SPREAD_DRAG_WARN_PCT:
+        return []
+    lines = [f"⚠️ {bold(f'[HIGH SPREAD FRICTION: {drag_f:.1f}% Drag]')}"]
+    slip = extra.get("entry_slippage_pts")
+    if slip is not None:
+        lines.append(f"📉 Est. Entry Slippage: ±{abs(float(slip)):.1f} Premium Pts")
+    return lines
+
+
+def _iv_crush_alarm_line(
+    *,
+    iv_crush_bleed: bool,
+    iv_at_entry: float | None = None,
+    iv_delta: float | None = None,
+    html: bool = True,
+) -> str | None:
+    if not iv_crush_bleed:
+        return None
+    drop_pct: float | None = None
+    if iv_at_entry and iv_at_entry > 0 and iv_delta is not None and iv_delta < 0:
+        drop_pct = abs(iv_delta) / iv_at_entry * 100.0
+    pct_text = f"{drop_pct:.1f}%" if drop_pct is not None else "—"
+    body = (
+        f"Premium is bleeding! IV is down {pct_text} while spot is consolidating sideways."
+    )
+    if html:
+        return f"🚨 {bold('[IV CRUSH ALARM]')}: {body}"
+    return f"🚨 [IV CRUSH ALARM]: {body}"
+
+
+def position_status_iv_alarm_lines(position: Position) -> list[str]:
+    """POSITION_STATUS (/position): IV crush callout below spot P&L."""
+    line = _iv_crush_alarm_line(
+        iv_crush_bleed=position.iv_crush_bleed,
+        iv_at_entry=position.iv_at_entry,
+        iv_delta=position.last_iv_delta,
+        html=False,
+    )
+    return [line] if line else []
+
+
+def _format_premium_brackets(position: Position) -> list[str]:
+    """Premium target/stop/R:R block for position status (plain text for /position)."""
+    if (not hasattr(position, 'premium_target_price') or
+        not hasattr(position, 'premium_stop_price') or
+        position.premium_target_price is None or
+        position.premium_stop_price is None):
+        return []
+
+    target_price = position.premium_target_price
+    stop_price = position.premium_stop_price
+    ltp = position.option_ltp or 0.0
+
+    # Distance = ltp - premium_target_price (signed)
+    distance = ltp - target_price
+    distance_str = f"+{distance:.1f}" if distance >= 0 else f"{distance:.1f}"
+
+    # R:R calculation
+    entry_ask = position.option_ask or (target_price / PREMIUM_TARGET_MULT) if target_price > 0 else 0
+    if entry_ask > 0:
+        reward = target_price - entry_ask
+        risk = entry_ask - stop_price
+        if risk > 0:
+            rr_ratio = reward / risk
+            rr_label = f"1:{rr_ratio:.2f}"
+        else:
+            rr_label = "1:∞"
+    else:
+        rr_label = "1:2.67"
+
+    target_pct = int(round((PREMIUM_TARGET_MULT - 1.0) * 100))
+    stop_pct = int(round((1.0 - PREMIUM_STOP_MULT) * 100))
+
+    return [
+        f"📈 Premium Target (+{target_pct}%): ₹{target_price:.2f} "
+        f"(Current LTP: ₹{ltp:.2f} | Distance: {distance_str} pts)",
+        f"📉 Premium Stop (-{stop_pct}%):   ₹{stop_price:.2f} "
+        f"(Risk-Reward Ratio: {rr_label} Premium Space)",
+    ]
+
+
+def _target_wick_postmortem_line(extra: dict, event_type: str) -> str | None:
+    if event_type not in ("TARGET_CE", "TARGET_PE"):
+        return None
+    if not extra.get("target_reverted_mid_bar"):
+        return None
+    return (
+        "ℹ️ Note: Target was a mid-bar wick hit only. Spot close reverted inside the "
+        "boundary. Live manual option fills may have experienced low probability execution."
+    )
 
 
 class TelegramAlerter:
@@ -327,6 +429,10 @@ class TelegramAlerter:
             return TelegramAlerter._fmt_squareoff(
                 event, extra, option_q, rr_ratio, strike_mode, bar_time_is_open,
             )
+        elif et == "POSITION_PREMIUM" and position:
+            return TelegramAlerter._fmt_position_premium(
+                event, extra, position, bar_time_is_open,
+            )
         else:
             return json.dumps(event.to_dict(), default=str)
 
@@ -376,6 +482,10 @@ class TelegramAlerter:
         else:
             header = f"{et}  •  {module_tag}{direction}"
             lines.append(f"🔔 {bold(header)}")
+
+        friction = _spread_friction_lines(extra)
+        if friction:
+            lines.extend(friction)
 
         lines.append(DIVIDER)
         lines.append(
@@ -447,6 +557,18 @@ class TelegramAlerter:
             if option_q.note:
                 lines.append(f"  ⚠️ {html_escape(option_q.note)}")
             lines.append(f"  {_spot_exit_plan(stop, target)}")
+            # Premium lifecycle brackets (Phase 2) - compact format for entry alerts
+            if ask and ask > 0:
+                from bot.option_truth import compute_premium_brackets
+                brackets = compute_premium_brackets(ask)
+                target_pct = int(round((PREMIUM_TARGET_MULT - 1.0) * 100))
+                stop_pct = int(round((1.0 - PREMIUM_STOP_MULT) * 100))
+                lines.append(
+                    f"  📈 Premium Target (+{target_pct}%): {bold(f'₹{brackets.target:.2f}')}  |  "
+                    f"📉 Premium Stop (-{stop_pct}%): {bold(f'₹{brackets.stop:.2f}')}  |  "
+                    f"R:R {brackets.rr_label}"
+                )
+            
             backup = _premium_backup_line(ask)
             if backup:
                 lines.append(f"  {backup}")
@@ -537,6 +659,100 @@ class TelegramAlerter:
         lines.append("")
         lines.append(f"📋 Reason: {html_escape(event.reason)}")
 
+        wick = _target_wick_postmortem_line(extra, et)
+        if wick:
+            lines.append("")
+            lines.append(wick)
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _fmt_position_premium(
+        event: SignalEvent,
+        extra: dict,
+        position: Position,
+        bar_time_is_open: bool = True,
+    ) -> str:
+        """POSITION_PREMIUM diagnostic ping (IV crush below P&L when flagged)."""
+        entry = position.entry_price
+        spot = event.price
+        is_ce = position.side.value == "CE"
+        if entry is not None:
+            spot_pnl = (spot - entry) if is_ce else (entry - spot)
+            pnl_line = pts_signed(spot_pnl)
+        else:
+            pnl_line = "—"
+
+        lines = [f"📊 {bold('POSITION STATUS')}  •  {position.side.value}"]
+        lines.append(DIVIDER)
+        lines.append(
+            f"⏰ Bar close: {bold(_bar_close_label(event.timestamp, bar_time_is_open=bar_time_is_open))}"
+        )
+        lines.append(DIVIDER)
+        lines.append(section("📍 SPOT P&L"))
+        lines.append(f"  Spot:   {price(spot)}")
+        lines.append(f"  P&L:    {pnl_line}")
+
+        iv_line = _iv_crush_alarm_line(
+            iv_crush_bleed=bool(extra.get("iv_crush_bleed") or position.iv_crush_bleed),
+            iv_at_entry=extra.get("iv_at_entry") or position.iv_at_entry,
+            iv_delta=extra.get("iv_delta") if extra.get("iv_delta") is not None else position.last_iv_delta,
+        )
+        if iv_line:
+            lines.append(iv_line)
+
+        return "\n".join(lines)
+
+    def chop_stop_exit(self, position: Position) -> None:
+        """Chop stop exit alert (Phase 2) - advisory only, no position state change."""
+        ltp = position.option_ltp or 0.0
+        symbol = position.option_symbol or f"NIFTY {position.option_strike} {position.side.value}"
+        
+        text = (
+            f"[VELOCITY CHOP STOP]: Position scratched at ₹{ltp:.2f}. "
+            f"20-minute velocity momentum window elapsed before target achieved.\n\n"
+            f"Strike: {html_escape(symbol)}"
+        )
+        
+        if has_telegram_alerts(self.cfg):
+            self._send_html(text)
+
+    @staticmethod
+    def format_position_status(
+        position: Position,
+        *,
+        spot: float | None,
+        spot_pnl: float | None,
+    ) -> str:
+        """Full POSITION_STATUS block for /position (open trade)."""
+        lines = [
+            f"📍 Open position — {position.side.value}",
+            DIVIDER,
+            f"Entry:   {position.entry_price:.2f}" if position.entry_price else "Entry:   —",
+        ]
+        if position.stop:
+            lines.append(f"SL:      {position.stop:.2f}")
+        else:
+            lines.append("SL:      —")
+        if position.target:
+            lines.append(f"Target:  {position.target:.2f}")
+        else:
+            lines.append("Target:  —")
+        if position.option_symbol:
+            lines.append(f"Option:  {position.option_symbol}")
+        if spot is not None:
+            if spot_pnl is not None:
+                arrow = "+" if spot_pnl > 0 else ""
+                lines.append(f"Spot:    {spot:.2f}  (P&L {arrow}{spot_pnl:.1f} pts vs entry)")
+            else:
+                lines.append(f"Spot:    {spot:.2f}")
+        
+        # Add premium bracket information (Phase 2)
+        premium_lines = _format_premium_brackets(position)
+        if premium_lines:
+            lines.extend(premium_lines)
+        
+        lines.extend(position_status_iv_alarm_lines(position))
         return "\n".join(lines)
 
     @staticmethod

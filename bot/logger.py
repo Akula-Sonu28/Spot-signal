@@ -122,6 +122,23 @@ LIVE_CSV_FIELDS = [
     "option_spread",
     "option_oi",
     "option_note",
+    "bars_in_trade",
+    "spot_from_entry",
+    "chop_streak",
+    "high_theta_decay_risk",
+    "premium_drawdown_pct",
+    "max_premium_drawdown_pct",
+    "max_spot_adverse_pts",
+    "premium_bleed_worse_than_spot",
+    "wick_would_sl",
+    "is_expiry_day",
+    "target_held_on_close",
+    "target_reverted_mid_bar",
+    "entry_slippage_pts",
+    "spread_drag_pct",
+    "iv_at_entry",
+    "iv_delta",
+    "iv_crush_bleed",
     "extra",
 ]
 
@@ -142,6 +159,13 @@ class LiveEventLogger:
             "option_strike", "option_type", "option_expiry", "option_symbol",
             "option_ltp", "option_bid", "option_ask", "option_spread", "option_oi", "option_note",
         }
+        diag_keys = {
+            "bars_in_trade", "spot_from_entry", "chop_streak", "high_theta_decay_risk",
+            "premium_drawdown_pct", "max_premium_drawdown_pct", "max_spot_adverse_pts",
+            "premium_bleed_worse_than_spot", "wick_would_sl", "is_expiry_day",
+            "target_held_on_close", "target_reverted_mid_bar", "entry_slippage_pts",
+            "spread_drag_pct", "iv_at_entry", "iv_delta", "iv_crush_bleed",
+        }
         row = {
             "timestamp": event.timestamp.isoformat(),
             "event_type": event.event_type,
@@ -157,9 +181,12 @@ class LiveEventLogger:
             "atr": extra.get("atr"),
             "reason": event.reason,
             "bar_index": event.bar_index,
-            "extra": json.dumps({k: v for k, v in extra.items() if k not in {"or_high", "or_low", "adx", "vwap", "atr", *option_keys}}),
+            "extra": json.dumps({
+                k: v for k, v in extra.items()
+                if k not in {"or_high", "or_low", "adx", "vwap", "atr", *option_keys, *diag_keys}
+            }),
         }
-        for k in option_keys:
+        for k in option_keys | diag_keys:
             if k in extra:
                 row[k] = extra.get(k)
         with self.path.open("a", newline="", encoding="utf-8") as f:

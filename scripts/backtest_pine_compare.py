@@ -18,6 +18,7 @@ from bot.backtest import ENTRY_TYPES, EXIT_TYPES, pair_trades, summarize_trades
 from bot.config import DEFAULT_CONFIG, CombinedStrategyConfig, StrategyConfig
 from bot.logger import ReplayLogger, SignalEvent
 from bot.replay import load_candles_csv, run_replay_fast
+from bot.strategy_audit import format_strategy_audit_report, run_strategy_audit
 from bot.strategy_j import J_TRAP_ROBUST, JTrapConfig
 from scripts.sweep_combined import _classify_sessions
 
@@ -115,6 +116,7 @@ def main() -> int:
     parser.add_argument("--to", dest="to_date", default="2026-06-12")
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--j-mode", choices=("robust", "base"), default="robust")
+    parser.add_argument("--audit", action="store_true", help="Print algorithmic structure audit")
     args = parser.parse_args()
 
     from_d = date.fromisoformat(args.from_date)
@@ -128,6 +130,12 @@ def main() -> int:
     jcfg = JTrapConfig() if args.j_mode == "base" else J_TRAP_ROBUST
     combined_cfg = CombinedStrategyConfig(strategy=cfg, enable_j_plus=True, j_trap=jcfg)
     combined_logger = run_replay_fast(df, cfg, combined_cfg=combined_cfg)
+
+    if args.audit:
+        audit = run_strategy_audit(combined_logger, df, cfg)
+        print()
+        print(format_strategy_audit_report(audit))
+        print()
 
     v38_only_cfg = CombinedStrategyConfig(strategy=cfg, enable_j_plus=False, j_trap=jcfg)
     v38_logger = run_replay_fast(df, cfg, combined_cfg=v38_only_cfg)

@@ -12,6 +12,11 @@ from bot.combined import process_session_bar
 from bot.config import CombinedStrategyConfig, DEFAULT_CONFIG, StrategyConfig, load_combined_config
 from bot.indicators import adx_series, atr_series, session_vwap_series
 from bot.logger import ReplayLogger
+from bot.premium_decay_diag import (
+    analyze_chop_from_replay,
+    format_audit_report,
+    format_chop_summary,
+)
 from bot.state import ReplayState, make_day_state
 from bot.strategy import build_bar_context
 
@@ -167,10 +172,30 @@ def main() -> None:
         action="store_true",
         help="Use precomputed indicators (faster, same result)",
     )
+    parser.add_argument(
+        "--chop-report",
+        action="store_true",
+        help="Print sideways chop / premium decay diagnostic after replay",
+    )
+    parser.add_argument(
+        "--audit",
+        action="store_true",
+        help="Print spot-vs-option structural gap audit",
+    )
     args = parser.parse_args()
 
     df = load_candles_csv(args.csv)
     logger = run_replay_fast(df) if args.fast else run_replay(df)
+
+    if args.audit:
+        print(format_audit_report())
+        print()
+
+    if args.chop_report:
+        enriched = _compute_indicators(df)
+        summary = analyze_chop_from_replay(logger, enriched, DEFAULT_CONFIG)
+        print(format_chop_summary(summary))
+        print()
 
     for event in logger.events:
         print(event.to_json())

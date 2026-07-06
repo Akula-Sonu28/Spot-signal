@@ -18,7 +18,7 @@ from bot.futures_vwap import _encode_key, _http_json, _urlopen_ssl
 
 NSE_JSON_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 OptionSide = Literal["CE", "PE"]
-StrikeMode = Literal["ATM", "ITM1", "ATM_OR_ITM1"]
+StrikeMode = Literal["ATM", "ITM1", "ITM2", "ATM_OR_ITM1"]
 
 # Manual option execution: buy at ask; SL = 50% premium loss (Pine v3.7 guidance).
 PREMIUM_SL_LOSS_FRAC = 0.5
@@ -96,12 +96,33 @@ def round_nifty_strike(spot: float) -> int:
     return int(round(spot / 50.0) * 50)
 
 
+def days_to_expiry(session_date: str, expiry_iso: str) -> int:
+    """Calendar days from session to expiry (0 on expiry Tuesday)."""
+    session = date.fromisoformat(session_date)
+    expiry = date.fromisoformat(expiry_iso)
+    return (expiry - session).days
+
+
+def effective_strike_mode(session_date: str, expiry: str, configured: StrikeMode) -> StrikeMode:
+    """If DTE <= 1 return internal 'ITM2'; else use configured mode (default ATM_OR_ITM1 → ATM)."""
+    dte = days_to_expiry(session_date, expiry)
+    if dte <= 1:
+        return "ITM2"
+    # ATM_OR_ITM1 defaults to ATM for non-expiry sessions
+    if configured == "ATM_OR_ITM1":
+        return "ATM"
+    return configured
+
+
 def pick_strike(spot: float, option_type: OptionSide, mode: StrikeMode) -> int:
     atm = round_nifty_strike(spot)
     if mode == "ATM":
         return atm
     if mode == "ITM1":
         return atm - 50 if option_type == "CE" else atm + 50
+    if mode == "ITM2":
+        # ITM-2: CE atm - 100, PE atm + 100  (2 × 50-pt strikes)
+        return atm - 100 if option_type == "CE" else atm + 100
     # ATM_OR_ITM1 — recommend ATM primary (same as Pine default display)
     return atm
 
@@ -364,19 +385,14 @@ def format_entry_pnl_lines(
     return lines
 
 
-def lookup_option(
-    spot: float,
+def lookup_by_contract(
+    strike: int,
     option_type: OptionSide,
+    expiry: str,
     token: str,
-    *,
-    strike_mode: StrikeMode = "ATM_OR_ITM1",
-    expiry: str | None = None,
 ) -> OptionQuote:
-    """Resolve strike + fetch bid/LTP. Falls back to strike-only if quotes blocked."""
-    expiry = expiry or nearest_weekly_expiry()
-    strike = pick_strike(spot, option_type, strike_mode)
+    """Fetch live quote for a known strike/expiry (open-position snapshots)."""
     inst = _find_instrument(strike, option_type, expiry)
-
     if inst is None:
         return OptionQuote(
             strike=strike,
@@ -384,9 +400,8 @@ def lookup_option(
             expiry=expiry,
             trading_symbol=f"NIFTY {strike} {option_type}",
             instrument_key="",
-            note="Contract not found in master — verify expiry/strike manually",
+            note="Contract not found in master",
         )
-
     quote = _fetch_full_quote(inst["instrument_key"], token)
     if quote is None:
         return OptionQuote(
@@ -395,7 +410,84 @@ def lookup_option(
             expiry=expiry,
             trading_symbol=inst["trading_symbol"],
             instrument_key=inst["instrument_key"],
-            note="Live bid/LTP unavailable (market closed or quote API restricted)",
+            note="Live bid/LTP unavailable",
+        )
+    bid, ask = _parse_bid_ask(quote)
+    ltp = quote.get("last_price")
+    ltp_f = float(ltp) if ltp is not None else None
+    spread = round(ask - bid, 2) if bid is not None and ask is not None else None
+    oi = quote.get("oi")
+    greeks = _fetch_option_greeks(inst["instrument_key"], token)
+    return OptionQuote(
+        strike=strike,
+        option_type=option_type,
+        expiry=expiry,
+        trading_symbol=inst["trading_symbol"],
+        instrument_key=inst["instrument_key"],
+        ltp=ltp_f,
+        bid=bid,
+        ask=ask,
+        spread=spread,
+        oi=float(oi) if oi is not None else None,
+        delta=greeks.delta if greeks else None,
+        theta=greeks.theta if greeks else None,
+        iv=greeks.iv if greeks else None,
+        gamma=greeks.gamma if greeks else None,
+        vega=greeks.vega if greeks else None,
+        quote_ok=True,
+    )
+
+
+def lookup_option(
+    spot: float,
+    option_type: OptionSide,
+    token: str,
+    *,
+    strike_mode: StrikeMode = "ATM_OR_ITM1",
+    expiry: str | None = None,
+    session_date: str | None = None,
+) -> OptionQuote:
+    """Resolve strike + fetch bid/LTP. Falls back to strike-only if quotes blocked."""
+    expiry = expiry or nearest_weekly_expiry()
+    
+    # Apply DTE override if session_date provided
+    if session_date is not None:
+        effective_mode = effective_strike_mode(session_date, expiry, strike_mode)
+        strike_selection_reason = ""
+        if effective_mode != strike_mode:
+            strike_selection_reason = f"DTE<={days_to_expiry(session_date, expiry)} → {effective_mode}"
+    else:
+        effective_mode = strike_mode
+        strike_selection_reason = ""
+    
+    strike = pick_strike(spot, option_type, effective_mode)
+    inst = _find_instrument(strike, option_type, expiry)
+
+    if inst is None:
+        note = "Contract not found in master — verify expiry/strike manually"
+        if strike_selection_reason:
+            note = f"{strike_selection_reason}. {note}"
+        return OptionQuote(
+            strike=strike,
+            option_type=option_type,
+            expiry=expiry,
+            trading_symbol=f"NIFTY {strike} {option_type}",
+            instrument_key="",
+            note=note,
+        )
+
+    quote = _fetch_full_quote(inst["instrument_key"], token)
+    if quote is None:
+        note = "Live bid/LTP unavailable (market closed or quote API restricted)"
+        if strike_selection_reason:
+            note = f"{strike_selection_reason}. {note}"
+        return OptionQuote(
+            strike=strike,
+            option_type=option_type,
+            expiry=expiry,
+            trading_symbol=inst["trading_symbol"],
+            instrument_key=inst["instrument_key"],
+            note=note,
         )
 
     bid, ask = _parse_bid_ask(quote)
@@ -404,9 +496,13 @@ def lookup_option(
     spread = round(ask - bid, 2) if bid is not None and ask is not None else None
     oi = quote.get("oi")
 
-    note = ""
+    note_parts = []
+    if strike_selection_reason:
+        note_parts.append(strike_selection_reason)
     if spread is not None and spread > 2.0:
-        note = f"Wide spread ({spread:.2f}) — check liquidity"
+        note_parts.append(f"Wide spread ({spread:.2f}) — check liquidity")
+    
+    note = ". ".join(note_parts)
 
     greeks = _fetch_option_greeks(inst["instrument_key"], token)
 
@@ -437,18 +533,19 @@ def lookup_for_signal(
     token: str,
     strike_mode: StrikeMode = "ATM_OR_ITM1",
     stored: OptionQuote | None = None,
+    session_date: str | None = None,
 ) -> OptionQuote | None:
     """Return option quote for entry/exit Telegram formatting."""
     if event_type == "BUY_CE":
-        return lookup_option(spot, "CE", token, strike_mode=strike_mode)
+        return lookup_option(spot, "CE", token, strike_mode=strike_mode, session_date=session_date)
     if event_type == "BUY_PE":
-        return lookup_option(spot, "PE", token, strike_mode=strike_mode)
+        return lookup_option(spot, "PE", token, strike_mode=strike_mode, session_date=session_date)
     if stored is not None:
         return stored
     if event_type.endswith("_CE"):
-        return lookup_option(spot, "CE", token, strike_mode=strike_mode)
+        return lookup_option(spot, "CE", token, strike_mode=strike_mode, session_date=session_date)
     if event_type.endswith("_PE"):
-        return lookup_option(spot, "PE", token, strike_mode=strike_mode)
+        return lookup_option(spot, "PE", token, strike_mode=strike_mode, session_date=session_date)
     return None
 
 

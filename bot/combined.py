@@ -5,6 +5,8 @@ from __future__ import annotations
 from bot.config import CombinedStrategyConfig, load_combined_config
 from bot.day_router import DayMode, ensure_day_mode
 from bot.logger import ReplayLogger
+from bot.premium_decay_diag import log_position_snapshot
+from bot.signal_enrich import enrich_target_wick_audit
 from bot.state import Position, PositionSide, ReplayState
 from bot.strategy import (
     BarContext,
@@ -73,8 +75,28 @@ def process_session_bar(
         before = len(logger.events)
         if _check_exit_on_bar(position, bar, logger, cfg):
             if len(logger.events) > before:
+                last = logger.events[-1]
+                if last.event_type in ("TARGET_CE", "TARGET_PE"):
+                    enrich_target_wick_audit(last, bar)
                 _finalize_position_exit(day, exit_side, exit_entry, active_strat, logger)
             return
+        # Phase 1 diagnostic: per-bar chop/decay snapshot (no strategy impact)
+        snap = log_position_snapshot(position, bar, logger, cfg, chop_streak=position.chop_streak)
+        position.chop_streak = int(snap.extra.get("chop_streak", 0))
+        
+        # Optional CHOP_STOP_EXIT replay log (Phase 2) - diagnostic only
+        if snap.extra and snap.extra.get("chop_stop_exit"):
+            logger.log_diagnostic(
+                "CHOP_STOP_EXIT",
+                bar,
+                f"20min velocity chop stop triggered - advisory exit at LTP ₹{position.option_ltp or 0:.2f}",
+                extra={
+                    "entry_bar_index": position.entry_bar_index,
+                    "bars_in_trade": bar.index - (position.entry_bar_index or 0),
+                    "option_ltp": position.option_ltp,
+                    "premium_velocity_min": getattr(position, 'premium_velocity_min', None),
+                }
+            )
 
     if position.side != PositionSide.FLAT:
         exit_side = position.side

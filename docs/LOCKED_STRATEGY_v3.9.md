@@ -1,7 +1,7 @@
 # Locked Strategy v3.9
 
 **Locked:** 2026-06-12  
-**Status:** Production default — do not change without new sweep + review.
+**Status:** Superseded by **v3.10** for production. See [LOCKED_STRATEGY_v3.10.md](LOCKED_STRATEGY_v3.10.md).
 
 ## Overview
 

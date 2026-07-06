@@ -13,8 +13,8 @@ if TYPE_CHECKING:
 # Hard safety default — no broker execution in this phase.
 AUTO_TRADE: bool = False
 
-# Frozen production strategy version (see docs/LOCKED_STRATEGY_v3.9.md)
-LOCKED_STRATEGY_VERSION: str = "3.9"
+# Frozen production strategy version (see docs/LOCKED_STRATEGY_v3.10.md)
+LOCKED_STRATEGY_VERSION: str = "3.10"
 
 
 @dataclass(frozen=True)
@@ -49,6 +49,9 @@ class StrategyConfig:
     monitor_stop_h: int = 15
     monitor_stop_m: int = 30
     max_trades_per_day: int = 2
+
+    # v3.10: no new BUY_CE/BUY_PE after this bar close (IST, HH:MM); empty = unrestricted
+    no_new_entries_after: str = "13:30"
 
     bar_time_is_open: bool = True
     timezone: str = "Asia/Kolkata"
@@ -176,6 +179,7 @@ def load_app_config(env_file: str | Path | None = ".env") -> AppConfig:
         sl_delay_bars=_env_int("SL_DELAY_BARS", DEFAULT_CONFIG.sl_delay_bars),
         sl_buffer_pts=float(os.getenv("SL_BUFFER_PTS", DEFAULT_CONFIG.sl_buffer_pts)),
         max_trades_per_day=_env_int("MAX_TRADES_PER_DAY", DEFAULT_CONFIG.max_trades_per_day),
+        no_new_entries_after=os.getenv("NO_NEW_ENTRIES_AFTER", DEFAULT_CONFIG.no_new_entries_after),
         use_vwap_filter=_env_bool("USE_VWAP_FILTER", DEFAULT_CONFIG.use_vwap_filter),
         timezone=os.getenv("TIMEZONE", DEFAULT_CONFIG.timezone),
     )

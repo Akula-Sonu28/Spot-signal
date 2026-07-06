@@ -1,0 +1,72 @@
+{
+  "windows": {
+    "in_sample": {
+      "from": "2025-05-02",
+      "to": "2026-03-31"
+    },
+    "out_of_sample": {
+      "from": "2026-04-01",
+      "to": "2026-06-09"
+    }
+  },
+  "candidate": {
+    "time_gate": "13:30",
+    "max_bars_outside_or": 2
+  },
+  "rows": [
+    {
+      "time_gate": "Baseline",
+      "max_bars_outside_or": "Unrestricted",
+      "total_trades": 242,
+      "win_rate_pct": 61.2,
+      "net_pnl_pts": 2535.75,
+      "profit_factor": 1.44,
+      "max_drawdown_pts": 490.88,
+      "horizon": "IS (Train)",
+      "variant": "Baseline v3.9",
+      "j_plus_trades": 0
+    },
+    {
+      "time_gate": "13:30",
+      "max_bars_outside_or": 2,
+      "total_trades": 198,
+      "win_rate_pct": 62.6,
+      "net_pnl_pts": 1886.38,
+      "profit_factor": 1.38,
+      "max_drawdown_pts": 437.76,
+      "horizon": "IS (Train)",
+      "variant": "13:30 + Cap 2",
+      "j_plus_trades": 13
+    },
+    {
+      "time_gate": "Baseline",
+      "max_bars_outside_or": "Unrestricted",
+      "total_trades": 39,
+      "win_rate_pct": 66.7,
+      "net_pnl_pts": 1155.94,
+      "profit_factor": 2.77,
+      "max_drawdown_pts": 99.5,
+      "horizon": "OOS (Test)",
+      "variant": "Baseline v3.9",
+      "j_plus_trades": 0
+    },
+    {
+      "time_gate": "13:30",
+      "max_bars_outside_or": 2,
+      "total_trades": 21,
+      "win_rate_pct": 81.0,
+      "net_pnl_pts": 1039.88,
+      "profit_factor": 5.22,
+      "max_drawdown_pts": 104.47,
+      "horizon": "OOS (Test)",
+      "variant": "13:30 + Cap 2",
+      "j_plus_trades": 3
+    }
+  ],
+  "alpha_degradation_ratio": 3.786,
+  "overfit_warning": false,
+  "overfit_note": "PF stable across IS/OOS",
+  "oos_j_plus_trades": 3,
+  "oos_j_plus_significant": false,
+  "min_oos_j_plus_trades": 15
+}

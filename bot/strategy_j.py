@@ -8,7 +8,7 @@ from bot.config import StrategyConfig
 from bot.logger import ReplayLogger
 from bot.state import DayState, PositionSide, ReplayState
 from bot.stops import capped_stops
-from bot.strategy import BarContext, _minutes_from_midnight, _session_times
+from bot.strategy import BarContext, _minutes_from_midnight, _session_times, new_entries_allowed
 
 
 @dataclass(frozen=True)
@@ -138,6 +138,8 @@ def process_bar_j_entries(
     """J+ trap-fade entries only (trap flags updated earlier by combined dispatcher)."""
     day = state.day
     if day is None or not day.or_defined or not bar.is_entry_window:
+        return
+    if not new_entries_allowed(bar, cfg):
         return
     if state.position.side != PositionSide.FLAT:
         return

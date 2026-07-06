@@ -10,7 +10,7 @@ import pytest
 from bot.config import StrategyConfig
 from bot.logger import ReplayLogger
 from bot.state import DayState, Position, PositionSide, ReplayState, make_day_state
-from bot.strategy import BarContext, _calc_stops, build_bar_context, process_bar, update_or
+from bot.strategy import BarContext, _calc_stops, build_bar_context, new_entries_allowed, process_bar, update_or
 
 TZ = ZoneInfo("Asia/Kolkata")
 
@@ -109,6 +109,31 @@ def test_buy_ce_on_breakout():
     assert len(entries) == 1
     assert entries[0].price == 24165
     assert state.position.side == PositionSide.CE
+
+
+def test_new_entries_allowed_on_1330_close():
+    cfg = StrategyConfig()
+    on_gate = _bar(19, 13, 25, 24155, 24170, 24152, 24165, vwap=24140, adx=22, atr=15)
+    assert new_entries_allowed(on_gate, cfg) is True
+    late = _bar(20, 13, 35, 24155, 24170, 24152, 24165, vwap=24140, adx=22, atr=15)
+    assert new_entries_allowed(late, cfg) is False
+
+
+def test_late_breakout_no_entry_after_1330():
+    cfg = StrategyConfig()
+    day = DayState(
+        session_date="2025-01-07",
+        or_high=24150,
+        or_low=24100,
+        or_defined=True,
+        or_bars_seen=3,
+    )
+    logger = ReplayLogger()
+    state = ReplayState(day=day, position=Position())
+    bar = _bar(20, 14, 0, 24155, 24170, 24152, 24165, vwap=24140, adx=22, atr=15)
+    process_bar(state, bar, logger, cfg)
+    assert logger.filter("BUY_CE") == []
+    assert state.position.side == PositionSide.FLAT
 
 
 def test_max_one_long_per_day():

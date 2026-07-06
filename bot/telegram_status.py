@@ -397,6 +397,7 @@ def format_position(
     cfg: AppConfig,
     probe: FeedProbeResult | None = None,
 ) -> str:
+    from bot.alerts import TelegramAlerter
     from bot.state import PositionSide
 
     monitor = ctx.monitor
@@ -407,28 +408,17 @@ def format_position(
     if pos.side == PositionSide.FLAT:
         return "Position: FLAT"
 
-    lines = [
-        f"📍 Open position — {pos.side.value}",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"Entry:   {pos.entry_price:.2f}",
-        f"SL:      {pos.stop:.2f}" if pos.stop else "SL:      —",
-        f"Target:  {pos.target:.2f}" if pos.target else "Target:  —",
-    ]
-    if pos.option_symbol:
-        lines.append(f"Option:  {pos.option_symbol}")
-
     spot = probe.last_close if probe and probe.ok and probe.last_close is not None else None
+    spot_pnl = None
     if spot is not None and pos.entry_price is not None:
         if pos.side == PositionSide.CE:
-            pnl = spot - pos.entry_price
+            spot_pnl = spot - pos.entry_price
         else:
-            pnl = pos.entry_price - spot
-        arrow = "+" if pnl > 0 else ""
-        lines.append(f"Spot:    {spot:.2f}  (P&L {arrow}{pnl:.1f} pts vs entry)")
-    elif spot is not None:
-        lines.append(f"Spot:    {spot:.2f}")
+            spot_pnl = pos.entry_price - spot
 
-    return truncate_telegram("\n".join(lines))
+    return truncate_telegram(
+        TelegramAlerter.format_position_status(pos, spot=spot, spot_pnl=spot_pnl)
+    )
 
 
 def _format_event_line(row: dict[str, str], cfg: AppConfig) -> str:

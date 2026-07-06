@@ -9,7 +9,7 @@ from bot.combined import process_session_bar
 from bot.config import CombinedStrategyConfig, StrategyConfig
 from bot.day_router import DayMode
 from bot.logger import ReplayLogger
-from bot.state import Position, ReplayState, make_day_state
+from bot.state import Position, PositionSide, ReplayState, make_day_state
 from bot.strategy import BarContext, build_bar_context, update_or
 from bot.strategy_j import J_TRAP_ROBUST
 
@@ -119,3 +119,38 @@ def test_enable_j_plus_false_blocks_wide_or_entries() -> None:
     process_session_bar(state, bar, logger, disabled)
     assert logger.filter("BUY_PE") == []
     assert logger.filter("BUY_CE") == []
+
+
+def test_v38_late_breakout_blocked_after_1330() -> None:
+    day = make_day_state("2026-03-02")
+    day.or_high = 80.0
+    day.or_low = 50.0
+    day.or_defined = True
+    day.day_mode = DayMode.V38.value
+
+    state = ReplayState(day=day, position=Position())
+    logger = ReplayLogger()
+    bar = _bar(14, 0, 85.0, 95.0, 84.0, 94.0, vwap=70.0, adx=22.0)
+
+    process_session_bar(state, bar, logger, COMBINED)
+    assert logger.filter("BUY_CE") == []
+    assert state.position.side.value == "FLAT"
+
+
+def test_j_plus_late_trap_entry_blocked_after_1330() -> None:
+    day = make_day_state("2026-03-02")
+    day.or_high = 110.0
+    day.or_low = 0.0
+    day.or_defined = True
+    day.day_mode = DayMode.J_PLUS.value
+    day.touched_above_or = True
+    day.trap_high = 125.0
+    day.first_trap_side = "PE"
+
+    state = ReplayState(day=day, position=Position())
+    logger = ReplayLogger()
+    bar = _bar(14, 0, 100.0, 101.0, 90.0, 91.0, vwap=102.0, adx=22.0)
+
+    process_session_bar(state, bar, logger, COMBINED)
+    assert logger.filter("BUY_PE") == []
+    assert state.position.side.value == "FLAT"

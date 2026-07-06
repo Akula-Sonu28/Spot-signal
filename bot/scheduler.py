@@ -17,6 +17,7 @@ from bot.early_watch import detect_early_or_watch, early_watch_key
 from bot.indicators import or_width
 from bot.logger import LiveEventLogger, ReplayLogger, SignalEvent
 from bot.state import LiveMonitorState, Position, make_day_state
+from bot.premium_decay_diag import POSITION_PREMIUM_EVENT
 from bot.signal_enrich import enrich_event, save_option_on_position, snapshot_option
 from bot.strategy import BarContext, build_bar_context
 
@@ -156,7 +157,7 @@ class LiveScheduler:
             if event.event_type in ("TARGET_CE", "TARGET_PE", "SL_CE", "SL_PE", "SQUARE_OFF"):
                 extra.update(option_snap)
             event.extra = extra
-            enrich_event(event, self.cfg, replay_position)
+            enrich_event(event, self.cfg, replay_position, bar=bar)
             if event.event_type in ("BUY_CE", "BUY_PE"):
                 save_option_on_position(replay_position, event)
             prepared.append(event)
@@ -370,8 +371,14 @@ class LiveScheduler:
             process_session_bar(replay, bar, logger, combined)
             after = len(logger.events)
             if after > before:
+                batch = logger.events[before:after]
+                for event in batch:
+                    if event.event_type == POSITION_PREMIUM_EVENT:
+                        enrich_event(event, self.cfg, replay.position, bar=bar)
+                        self.event_log.append(event)
+                        continue
                 prepared = self._prepare_trade_events(
-                    logger.events[before:after],
+                    batch,
                     bar=bar,
                     option_snap=option_snap,
                     replay_position=replay.position,
@@ -382,6 +389,17 @@ class LiveScheduler:
             monitor.sync_from_replay(replay)
             monitor.last_processed_candle = bar_key
             bars_processed += 1
+
+            # Dispatch one-time chop stop Telegram alert (Phase 2)
+            if (monitor.position.side.value in ("CE", "PE") and 
+                hasattr(monitor.position, 'chop_stop_triggered') and
+                monitor.position.chop_stop_triggered and
+                f"chop_stop_{session_date}_{monitor.position.entry_bar_index}" not in monitor.dispatched_alert_keys):
+                
+                self.alerter.chop_stop_exit(monitor.position)
+                alert_key = f"chop_stop_{session_date}_{monitor.position.entry_bar_index}"
+                monitor.dispatched_alert_keys.append(alert_key)
+                self.event_log.log_system("CHOP_STOP_DISPATCHED", f"Velocity chop stop alert sent for bar {monitor.position.entry_bar_index}")
 
             if monitor.day and monitor.day.or_defined and not monitor.or_alert_sent:
                 width = or_width(monitor.day.or_high, monitor.day.or_low)

@@ -31,6 +31,23 @@ class Position:
     option_symbol: str | None = None
     option_bid: float | None = None
     option_ask: float | None = None
+    option_entry_premium: float | None = None
+    option_ltp: float | None = None
+    iv_at_entry: float | None = None
+    # Diagnostic accumulators (Phase 1 — no strategy impact)
+    chop_streak: int = 0
+    max_spot_adverse_pts: float = 0.0
+    max_premium_drawdown_pct: float = 0.0
+    premium_bleed_worse_than_spot: bool = False
+    iv_crush_bleed: bool = False
+    high_spread_drag: bool = False
+    last_iv_delta: float | None = None
+    # Premium-space lifecycle (Phase 2)
+    premium_target_price: float | None = None
+    premium_stop_price: float | None = None
+    premium_velocity_min: float | None = None
+    chop_stop_triggered: bool = False
+    chop_stop_alerted: bool = False
 
 
 @dataclass
@@ -151,6 +168,22 @@ def reset_position(position: Position) -> None:
     position.option_symbol = None
     position.option_bid = None
     position.option_ask = None
+    position.option_entry_premium = None
+    position.option_ltp = None
+    position.iv_at_entry = None
+    position.chop_streak = 0
+    position.max_spot_adverse_pts = 0.0
+    position.max_premium_drawdown_pct = 0.0
+    position.premium_bleed_worse_than_spot = False
+    position.iv_crush_bleed = False
+    position.high_spread_drag = False
+    position.last_iv_delta = None
+    # Reset premium lifecycle fields
+    position.premium_target_price = None
+    position.premium_stop_price = None
+    position.premium_velocity_min = None
+    position.chop_stop_triggered = False
+    position.chop_stop_alerted = False
 
 
 def position_snapshot(position: Position) -> dict[str, Any]:
@@ -190,6 +223,22 @@ def _position_to_dict(pos: Position) -> dict[str, Any]:
         "option_symbol": pos.option_symbol,
         "option_bid": pos.option_bid,
         "option_ask": pos.option_ask,
+        "option_entry_premium": pos.option_entry_premium,
+        "option_ltp": pos.option_ltp,
+        "iv_at_entry": pos.iv_at_entry,
+        "chop_streak": pos.chop_streak,
+        "max_spot_adverse_pts": pos.max_spot_adverse_pts,
+        "max_premium_drawdown_pct": pos.max_premium_drawdown_pct,
+        "premium_bleed_worse_than_spot": pos.premium_bleed_worse_than_spot,
+        "iv_crush_bleed": pos.iv_crush_bleed,
+        "high_spread_drag": pos.high_spread_drag,
+        "last_iv_delta": pos.last_iv_delta,
+        # Premium lifecycle fields
+        "premium_target_price": pos.premium_target_price,
+        "premium_stop_price": pos.premium_stop_price,
+        "premium_velocity_min": pos.premium_velocity_min,
+        "chop_stop_triggered": pos.chop_stop_triggered,
+        "chop_stop_alerted": pos.chop_stop_alerted,
     }
 
 
@@ -206,6 +255,22 @@ def _position_from_dict(raw: dict[str, Any]) -> Position:
         option_symbol=raw.get("option_symbol"),
         option_bid=raw.get("option_bid"),
         option_ask=raw.get("option_ask"),
+        option_entry_premium=raw.get("option_entry_premium"),
+        option_ltp=raw.get("option_ltp"),
+        iv_at_entry=raw.get("iv_at_entry"),
+        chop_streak=int(raw.get("chop_streak", 0)),
+        max_spot_adverse_pts=float(raw.get("max_spot_adverse_pts", 0.0)),
+        max_premium_drawdown_pct=float(raw.get("max_premium_drawdown_pct", 0.0)),
+        premium_bleed_worse_than_spot=bool(raw.get("premium_bleed_worse_than_spot", False)),
+        iv_crush_bleed=bool(raw.get("iv_crush_bleed", False)),
+        high_spread_drag=bool(raw.get("high_spread_drag", False)),
+        last_iv_delta=raw.get("last_iv_delta"),
+        # Premium lifecycle fields
+        premium_target_price=raw.get("premium_target_price"),
+        premium_stop_price=raw.get("premium_stop_price"),
+        premium_velocity_min=raw.get("premium_velocity_min"),
+        chop_stop_triggered=bool(raw.get("chop_stop_triggered", False)),
+        chop_stop_alerted=bool(raw.get("chop_stop_alerted", False)),
     )
 
 

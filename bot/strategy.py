@@ -41,6 +41,23 @@ def _minutes_from_midnight(dt: datetime) -> int:
     return dt.hour * 60 + dt.minute
 
 
+def _bar_close_minutes(bar_min: int, cfg: StrategyConfig) -> int:
+    return bar_min + 5 if cfg.bar_time_is_open else bar_min
+
+
+def new_entries_allowed(bar: BarContext, cfg: StrategyConfig = DEFAULT_CONFIG) -> bool:
+    """True when bar close is on or before no_new_entries_after (v3.10 afternoon gate)."""
+    cutoff = cfg.no_new_entries_after
+    if not cutoff or not str(cutoff).strip():
+        return True
+    parts = str(cutoff).strip().split(":")
+    if len(parts) != 2:
+        return True
+    gate_min = int(parts[0]) * 60 + int(parts[1])
+    close_min = _bar_close_minutes(_minutes_from_midnight(bar.timestamp), cfg)
+    return close_min <= gate_min
+
+
 def _session_times(cfg: StrategyConfig) -> tuple[int, int, int]:
     market_open = cfg.market_open_h * 60 + cfg.market_open_m
     or_end = market_open + cfg.or_minutes
@@ -295,6 +312,8 @@ def _process_v38_entries(
     """v3.8 OR breakout entries (valid OR width only)."""
     day = state.day
     if day is None or not day.or_defined or not bar.is_entry_window:
+        return
+    if not new_entries_allowed(bar, cfg):
         return
 
     position = state.position
